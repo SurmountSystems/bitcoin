@@ -23,9 +23,11 @@
 #include <logging.h>
 #include <node/blockstorage.h>
 #include <node/chainstate.h>
+#include <node/database_args.h>
 #include <node/dbcache.h>
 #include <random.h>
 #include <script/sigcache.h>
+#include <common/args.h>
 #include <util/chaintype.h>
 #include <util/fs.h>
 #include <util/signalinterrupt.h>
@@ -109,6 +111,9 @@ int main(int argc, char* argv[])
 
     kernel::CacheSizes cache_sizes{node::GetDefaultDBCache()};
 
+    DBOptions db_options{};
+    node::ReadDatabaseArgs(ArgsManager{}, db_options);
+
     // SETUP: Chainstate
     auto chainparams = CChainParams::Main();
     const ChainstateManager::Options chainman_opts{
@@ -124,6 +129,7 @@ int main(int argc, char* argv[])
         .block_tree_db_params = DBParams{
             .path = abs_datadir / "blocks" / "index",
             .cache_bytes = cache_sizes.block_tree_db,
+            .options = db_options,
         },
     };
     util::SignalInterrupt interrupt;

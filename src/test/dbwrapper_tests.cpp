@@ -3,13 +3,20 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <dbwrapper.h>
+#include <dbwrapper_leveldb_migrate.h>
+#include <serialize.h>
+#include <streams.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <util/string.h>
 
+#include <atomic>
 #include <memory>
 #include <ranges>
+#include <chrono>
+#include <thread>
+#include <vector>
 
 #include <boost/test/unit_test.hpp>
 
@@ -242,7 +249,7 @@ BOOST_AUTO_TEST_CASE(existing_data_no_obfuscate)
     BOOST_CHECK(dbw->Read(key, res));
     BOOST_CHECK_EQUAL(res.ToString(), in.ToString());
 
-    // Call the destructor to free leveldb LOCK
+    // Call the destructor to release the LMDB environment lock
     dbw.reset();
 
     // Now, set up another wrapper that wants to obfuscate the same directory
@@ -283,7 +290,7 @@ BOOST_AUTO_TEST_CASE(existing_data_reindex)
     BOOST_CHECK(dbw->Read(key, res));
     BOOST_CHECK_EQUAL(res.ToString(), in.ToString());
 
-    // Call the destructor to free leveldb LOCK
+    // Call the destructor to release the LMDB environment lock
     dbw.reset();
 
     // Simulate a -reindex by wiping the existing data store
@@ -313,7 +320,7 @@ BOOST_AUTO_TEST_CASE(iterator_ordering)
         if (!(x & 1)) BOOST_CHECK(dbw.Write(key, value));
     }
 
-    // Check that creating an iterator creates a snapshot
+    // Check that creating an iterator creates a snapshot (IteratorImpl uses a dedicated read txn).
     std::unique_ptr<CDBIterator> it(const_cast<CDBWrapper&>(dbw).NewIterator());
 
     for (unsigned int x=0x00; x<256; ++x) {
@@ -418,8 +425,196 @@ BOOST_AUTO_TEST_CASE(unicodepath)
     fs::path ph = m_args.GetDataDirBase() / "test_runner_₿_🏃_20191128_104644";
     CDBWrapper dbw({.path = ph, .cache_bytes = 1 << 20});
 
-    fs::path lockPath = ph / "LOCK";
+    fs::path lockPath = ph / "lock.mdb";
     BOOST_CHECK(fs::exists(lockPath));
+}
+
+BOOST_AUTO_TEST_CASE(dbwrapper_concurrent_reads)
+{
+    fs::path ph = m_args.GetDataDirBase() / "dbwrapper_concurrent_reads";
+    constexpr size_t CACHE_SIZE{1_MiB};
+    constexpr int NUM_KEYS{64};
+    constexpr int NUM_THREADS{8};
+
+    CDBWrapper dbw{{.path = ph, .cache_bytes = CACHE_SIZE, .wipe_data = true, .obfuscate = false}};
+    std::vector<std::pair<uint8_t, uint256>> key_values;
+    key_values.reserve(NUM_KEYS);
+    for (uint8_t k = 0; k < NUM_KEYS; ++k) {
+        uint256 value{m_rng.rand256()};
+        BOOST_CHECK(dbw.Write(k, value));
+        key_values.emplace_back(k, value);
+    }
+
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    threads.reserve(NUM_THREADS);
+    for (int t = 0; t < NUM_THREADS; ++t) {
+        threads.emplace_back([&dbw, &key_values, &failures]() {
+            for (const auto& [key, expected] : key_values) {
+                uint256 actual;
+                if (!dbw.Read(key, actual) || actual != expected) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    BOOST_CHECK_EQUAL(failures.load(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(dbwrapper_concurrent_read_write)
+{
+    fs::path ph = m_args.GetDataDirBase() / "dbwrapper_concurrent_read_write";
+    constexpr size_t CACHE_SIZE{1_MiB};
+    CDBWrapper dbw{{.path = ph, .cache_bytes = CACHE_SIZE, .wipe_data = true, .obfuscate = false}};
+    BOOST_REQUIRE(dbw.Write(uint8_t{0}, m_rng.rand256()));
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> read_failures{0};
+    std::atomic<int> iterator_failures{0};
+
+    std::thread writer([&]() {
+        for (int round = 0; round < 50; ++round) {
+            for (uint8_t k = 0; k < 16; ++k) {
+                if (!dbw.Write(k, m_rng.rand256())) {
+                    read_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        stop.store(true, std::memory_order_release);
+    });
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_acquire)) {
+                uint256 value;
+                if (!dbw.Read(uint8_t{0}, value)) {
+                    read_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    std::thread iterator_thread([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        std::unique_ptr<CDBIterator> it{dbw.NewIterator()};
+        it->Seek(uint8_t{0});
+        uint256 snapshot_value;
+        if (!it->Valid() || !it->GetValue(snapshot_value)) {
+            iterator_failures.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        while (!stop.load(std::memory_order_acquire)) {
+            uint256 current;
+            if (!it->GetValue(current) || current != snapshot_value) {
+                iterator_failures.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    });
+
+    writer.join();
+    for (auto& reader : readers) reader.join();
+    iterator_thread.join();
+
+    BOOST_CHECK_EQUAL(read_failures.load(), 0);
+    BOOST_CHECK_EQUAL(iterator_failures.load(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(dbwrapper_map_growth)
+{
+    fs::path ph = m_args.GetDataDirBase() / "dbwrapper_map_growth";
+    constexpr size_t TINY_MAP{256 << 10};
+    CDBWrapper dbw{{.path = ph, .cache_bytes = 1 << 20, .wipe_data = true, .map_size_bytes = TINY_MAP}};
+
+    CDBBatch batch(dbw);
+    const std::string payload(32 << 10, 'x');
+    for (uint8_t k = 0; k < 32; ++k) {
+        batch.Write(k, payload);
+    }
+    BOOST_CHECK(dbw.WriteBatch(batch));
+    std::string read_back;
+    BOOST_CHECK(dbw.Read(uint8_t{31}, read_back));
+    BOOST_CHECK_EQUAL(read_back, payload);
+}
+
+static std::vector<std::pair<std::string, std::string>> SerializeLevelDBEntries(
+    const std::vector<std::pair<uint8_t, uint256>>& entries)
+{
+    std::vector<std::pair<std::string, std::string>> serialized;
+    serialized.reserve(entries.size());
+    for (const auto& [key, value] : entries) {
+        DataStream ssKey, ssValue;
+        ssKey << key;
+        ssValue << value;
+        serialized.emplace_back(ssKey.str(), ssValue.str());
+    }
+    return serialized;
+}
+
+BOOST_AUTO_TEST_CASE(leveldb_migration)
+{
+    fs::path ph = m_args.GetDataDirBase() / "leveldb_migration";
+    fs::remove_all(ph);
+    fs::create_directories(ph);
+
+    std::vector<std::pair<uint8_t, uint256>> entries;
+    for (uint8_t k = 10; k < 15; ++k) {
+        entries.emplace_back(k, m_rng.rand256());
+    }
+    BOOST_REQUIRE(dbwrapper_leveldb_migrate::WriteLevelDBTestEntries(ph, SerializeLevelDBEntries(entries)));
+
+    size_t final_map_size{0};
+    const std::string error = dbwrapper_leveldb_migrate::MigrateLevelDBToLMDB(ph, 0, &final_map_size);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(final_map_size > 0);
+    BOOST_CHECK(fs::exists(ph / "data.mdb"));
+    BOOST_CHECK(fs::exists(fs::u8path(fs::PathToString(ph) + ".leveldb.bak")));
+
+    CDBWrapper dbw{{.path = ph, .cache_bytes = 1 << 20, .obfuscate = false}};
+    for (const auto& [key, expected] : entries) {
+        uint256 actual;
+        BOOST_CHECK(dbw.Read(key, actual));
+        BOOST_CHECK_EQUAL(actual, expected);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(leveldb_migration_disabled)
+{
+    const bool old_setting = dbwrapper_settings::g_auto_migrate_leveldb;
+    dbwrapper_settings::g_auto_migrate_leveldb = false;
+
+    fs::path ph = m_args.GetDataDirBase() / "leveldb_migration_disabled";
+    fs::remove_all(ph);
+    fs::create_directories(ph);
+    BOOST_REQUIRE(dbwrapper_leveldb_migrate::WriteLevelDBTestEntries(ph, SerializeLevelDBEntries({{11, m_rng.rand256()}})));
+
+    bool threw{false};
+    try {
+        CDBWrapper{{.path = ph, .cache_bytes = 1 << 20}};
+    } catch (const dbwrapper_error&) {
+        threw = true;
+    }
+    BOOST_CHECK(threw);
+
+    dbwrapper_settings::g_auto_migrate_leveldb = old_setting;
+}
+
+BOOST_AUTO_TEST_CASE(leveldb_migration_stale_backup)
+{
+    fs::path ph = m_args.GetDataDirBase() / "leveldb_migration_stale_backup";
+    fs::remove_all(ph);
+    fs::remove_all(fs::u8path(fs::PathToString(ph) + ".leveldb.bak"));
+    fs::create_directories(ph);
+    BOOST_REQUIRE(dbwrapper_leveldb_migrate::WriteLevelDBTestEntries(ph, SerializeLevelDBEntries({{12, m_rng.rand256()}})));
+    fs::create_directories(fs::u8path(fs::PathToString(ph) + ".leveldb.bak"));
+
+    const std::string error = dbwrapper_leveldb_migrate::MigrateLevelDBToLMDB(ph, 0);
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(error.find("backup already exists") != std::string::npos);
 }
 
 

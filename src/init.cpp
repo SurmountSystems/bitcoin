@@ -163,15 +163,15 @@ static constexpr bool DEFAULT_STOPAFTERBLOCKIMPORT{false};
 static constexpr auto SYNC_CHECK_INTERVAL{30s};
 
 #ifdef WIN32
-// Win32 LevelDB doesn't use filedescriptors, and the ones used for
+// Win32 LMDB doesn't use many file descriptors, and the ones used for
 // accessing block files don't count towards the fd_set size limit
 // anyway.
-#define MIN_LEVELDB_FDS 0
+#define MIN_LMDB_FDS 0
 #else
-#define MIN_LEVELDB_FDS 150
+#define MIN_LMDB_FDS 8
 #endif
 
-static constexpr int MIN_CORE_FDS = MIN_LEVELDB_FDS + NUM_FDS_MESSAGE_CAPTURE;
+static constexpr int MIN_CORE_FDS = MIN_LMDB_FDS + NUM_FDS_MESSAGE_CAPTURE;
 static const char* DEFAULT_ASMAP_FILENAME="ip_asn.map";
 
 /**
@@ -539,6 +539,12 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                              1, 1024,
                              DEFAULT_DB_FILE_SIZE),
                    ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-dbmapsize=<n>",
+                   "Explicit LMDB map size for chainstate databases, in MiB (0 = derive from -dbcache, default: 0).",
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-migrateleveldb",
+                   strprintf("Automatically migrate legacy LevelDB directories to LMDB on startup (default: %u)", true),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-allowignoredconf", strprintf("For backwards compatibility, treat an unused %s file in the datadir as a warning, not an error.", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-loadblock=<file>", "Imports blocks from external file on startup", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);

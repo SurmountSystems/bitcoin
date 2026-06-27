@@ -28,6 +28,7 @@ add_library(bitcoinkernel
   ../consensus/tx_verify.cpp
   ../core_read.cpp
   ../dbwrapper.cpp
+  ../dbwrapper_leveldb_migrate.cpp
   ../deploymentinfo.cpp
   ../deploymentstatus.cpp
   ../flatfile.cpp
@@ -96,7 +97,9 @@ target_link_libraries(bitcoinkernel
     external_lib_interface
     bitcoin_clientversion
     bitcoin_crypto
-    leveldb
+    lmdb
+    leveldb_migration
+    crc32c
     secp256k1
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
   PUBLIC

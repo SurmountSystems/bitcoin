@@ -6163,21 +6163,21 @@ Chainstate& ChainstateManager::InitializeChainstate(CTxMemPool* mempool)
     }
 
     std::string path_str = fs::PathToString(db_path);
-    LogPrintf("Removing leveldb dir at %s\n", path_str);
+    LogPrintf("Removing chainstate database dir at %s\n", path_str);
 
-    // We have to destruct before this call leveldb::DB in order to release the db
-    // lock, otherwise `DestroyDB` will fail. See `leveldb::~DBImpl()`.
+    // We have to destruct the CDBWrapper (LMDB env) before DestroyDB in order to release
+    // the environment lock, otherwise removal will fail.
     const bool destroyed = DestroyDB(path_str);
 
     if (!destroyed) {
-        LogError("leveldb DestroyDB call failed on %s", path_str);
+        LogError("DestroyDB call failed on %s", path_str);
     }
 
     // Datadir should be removed from filesystem; otherwise initialization may detect
-    // it on subsequent statups and get confused.
+    // it on subsequent startups and get confused.
     //
     // If the base_blockhash_path removal above fails in the case of snapshot
-    // chainstates, this will return false since leveldb won't remove a non-empty
+    // chainstates, this will return false since DestroyDB won't remove a non-empty
     // directory.
     return destroyed && !fs::exists(db_path);
 }
@@ -6275,11 +6275,11 @@ util::Result<CBlockIndex*> ChainstateManager::ActivateSnapshot(
     auto cleanup_bad_snapshot = [&](bilingual_str reason) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
         this->MaybeRebalanceCaches();
 
-        // PopulateAndValidateSnapshot can return (in error) before the leveldb datadir
+        // PopulateAndValidateSnapshot can return (in error) before the chainstate datadir
         // has been created, so only attempt removal if we got that far.
         if (auto snapshot_datadir = node::FindSnapshotChainstateDir(m_options.datadir)) {
-            // We have to destruct leveldb::DB in order to release the db lock, otherwise
-            // DestroyDB() (in DeleteCoinsDBFromDisk()) will fail. See `leveldb::~DBImpl()`.
+            // We have to destruct the CDBWrapper (LMDB env) before DestroyDB in order to
+            // release the environment lock.
             // Destructing the chainstate (and so resetting the coinsviews object) does this.
             snapshot_chainstate.reset();
             bool removed = DeleteCoinsDBFromDisk(*snapshot_datadir, /*is_snapshot=*/true);
@@ -6687,7 +6687,7 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation()
     // assumeutxo hash we expect.
     //
     // TODO: For belt-and-suspenders, we could cache the UTXO set
-    // hash for the snapshot when it's loaded in its chainstate's leveldb. We could then
+    // hash for the snapshot when it's loaded in its chainstate LMDB database. We could then
     // reference that here for an additional check.
     if (AssumeutxoHash{ibd_stats.hashSerialized} != au_data.hash_serialized) {
         LogWarning("[snapshot] hash mismatch: actual=%s, expected=%s",
@@ -6984,7 +6984,7 @@ bool ChainstateManager::ValidatedSnapshotCleanup()
     const auto& snapshot_chainstate_path = *snapshot_chainstate_path_maybe;
     const auto& ibd_chainstate_path = *ibd_chainstate_path_maybe;
 
-    // Since we're going to be moving around the underlying leveldb filesystem content
+    // Since we're going to be moving around the underlying chainstate database filesystem content
     // for each chainstate, make sure that the chainstates (and their constituent
     // CoinsViews members) have been destructed first.
     //
@@ -7008,7 +7008,7 @@ bool ChainstateManager::ValidatedSnapshotCleanup()
                   fs::PathToString(p_old), fs::PathToString(p_new), err.what());
         GetNotifications().fatalError(strprintf(_(
             "Rename of '%s' -> '%s' failed. "
-            "Cannot clean up the background chainstate leveldb directory."),
+            "Cannot clean up the background chainstate database directory."),
             fs::PathToString(p_old), fs::PathToString(p_new)));
     };
 

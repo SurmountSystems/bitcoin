@@ -20,6 +20,7 @@ Bitcoin Core requires one of the following compilers.
 | CMake | [link](https://cmake.org/) | N/A | [3.22](https://github.com/bitcoin/bitcoin/pull/30454) | No |
 | [Boost](../depends/packages/boost.mk) | [link](https://www.boost.org/users/download/) | [1.81.0](https://github.com/bitcoin/bitcoin/pull/26557) | [1.73.0](https://github.com/bitcoin/bitcoin/pull/29066) | No |
 | [libevent](../depends/packages/libevent.mk) | [link](https://github.com/libevent/libevent/releases) | [2.1.12-stable](https://github.com/bitcoin/bitcoin/pull/21991) | [2.1.8](https://github.com/bitcoin/bitcoin/pull/24681) | No |
+| [LMDB](https://www.symas.com/lmdb) (embedded in `src/lmdb/` or system via `-DWITH_SYSTEM_LMDB=ON`) | [link](https://www.symas.com/lmdb) | 0.9.35 | 0.9.31 | Yes |
 | glibc | [link](https://www.gnu.org/software/libc/) | N/A | [2.31](https://github.com/bitcoin/bitcoin/pull/29987) | Yes |
 | Linux Kernel (if building that platform) | [link](https://www.kernel.org/) | N/A | [3.17.0](https://github.com/bitcoin/bitcoin/pull/27699) | Yes |
 

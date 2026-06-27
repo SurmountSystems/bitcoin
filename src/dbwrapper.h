@@ -25,25 +25,38 @@ util::Result<void> dbwrapper_SanityCheck();
 
 static const size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
 static const size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
+//! Legacy LevelDB-era name; used only as an LMDB map-size heuristic via -dbfilesize.
 static const size_t DBWRAPPER_MAX_FILE_SIZE = 32 << 20; // 32 MiB
 
 static constexpr size_t DEFAULT_DB_FILE_SIZE{64};
+//! Minimum LMDB max key size required (embedded build uses 8192).
+static constexpr int DBWRAPPER_MIN_MAX_KEY_SIZE{512};
+
+class ArgsManager;
+
+namespace dbwrapper_settings {
+//! Global LMDB map size override from -dbmapsize (bytes). Zero means derive per database.
+extern size_t g_db_map_size;
+//! When true, automatically migrate LevelDB directories to LMDB on open.
+extern bool g_auto_migrate_leveldb;
+void InitFromArgs(const ArgsManager& args);
+} // namespace dbwrapper_settings
 
 //! User-controlled performance and debug options.
 struct DBOptions {
     //! Compact database on startup.
     bool force_compact = false;
-    //! Target size of files.
+    //! Legacy LevelDB-era file size hint (-dbfilesize); used only for LMDB map-size heuristics.
     size_t max_file_size{DEFAULT_DB_FILE_SIZE << 20};
 };
 
 //! Application-specific storage settings.
 struct DBParams {
-    //! Location in the filesystem where leveldb data will be stored.
+    //! Location in the filesystem where database data will be stored.
     fs::path path;
-    //! Configures various leveldb cache settings.
+    //! Configures LMDB map sizing and reader pool tuning.
     size_t cache_bytes;
-    //! If true, use leveldb's memory environment.
+    //! If true, use an in-memory database (temporary directory).
     bool memory_only = false;
     //! If true, remove all existing data.
     bool wipe_data = false;
@@ -52,6 +65,10 @@ struct DBParams {
     bool obfuscate = false;
     //! Passed-through options.
     DBOptions options{};
+    //! Optional per-database LMDB map size override (bytes). Zero uses global/default sizing.
+    size_t map_size_bytes{0};
+    //! When true, apply the global -dbmapsize override to this database.
+    bool use_global_map_size{false};
 };
 
 class dbwrapper_error : public std::runtime_error
@@ -82,7 +99,7 @@ class CDBBatch
     friend class CDBWrapper;
 
 private:
-    static constexpr size_t kHeader{12}; // See: src/leveldb/db/write_batch.cc#L27
+    static constexpr size_t kHeader{12};
 
     const CDBWrapper &parent;
 
@@ -146,7 +163,7 @@ public:
 
     /**
      * @param[in] _parent          Parent CDBWrapper instance.
-     * @param[in] _piter           The original leveldb iterator.
+     * @param[in] _piter           The original iterator implementation.
      */
     CDBIterator(const CDBWrapper& _parent, std::unique_ptr<IteratorImpl> _piter);
     ~CDBIterator();
@@ -186,14 +203,16 @@ public:
     }
 };
 
-struct LevelDBContext;
+struct LMDBContext;
 
 class CDBWrapper
 {
     friend const Obfuscation& dbwrapper_private::GetObfuscateKey(const CDBWrapper&);
+    friend class CDBBatch;
+    friend class CDBIterator;
 private:
-    //! holds all leveldb-specific fields of this class
-    std::unique_ptr<LevelDBContext> m_db_context;
+    //! holds all LMDB-specific fields of this class
+    std::unique_ptr<LMDBContext> m_db_context;
 
     //! the name of this database
     std::string m_name;
@@ -206,8 +225,11 @@ private:
 
     std::vector<unsigned char> CreateObfuscateKey() const;
 
-    //! path to filesystem storage
+    //! path to filesystem storage (logical path for memory-only databases)
     const fs::path m_path;
+
+    //! actual on-disk LMDB environment path
+    fs::path m_storage_path;
 
     //! whether or not the database resides in memory
     bool m_is_memory;
@@ -216,6 +238,9 @@ private:
     bool ExistsImpl(Span<const std::byte> key) const;
     size_t EstimateSizeImpl(Span<const std::byte> key1, Span<const std::byte> key2) const;
     auto& DBContext() const LIFETIMEBOUND { return *Assert(m_db_context); }
+    void GrowMapSize();
+    void GrowMapSizeUnlocked();
+    size_t RequiredMapSize() const;
 
 public:
     CDBWrapper(const DBParams& params);
@@ -279,7 +304,7 @@ public:
 
     bool WriteBatch(CDBBatch& batch, bool fSync = false);
 
-    // Get an estimate of LevelDB memory usage (in bytes).
+    // Get an estimate of LMDB map usage (in bytes).
     size_t DynamicMemoryUsage() const;
 
     CDBIterator* NewIterator();

@@ -56,8 +56,8 @@ void CCoinsViewDB::ResizeCache(size_t new_cache_size)
     // We can't do this operation with an in-memory DB since we'll lose all the coins upon
     // reset.
     if (!m_db_params.memory_only) {
-        // Have to do a reset first to get the original `m_db` state to release its
-        // filesystem lock.
+        // Reopen the LMDB environment to tune reader pool size (maxreaders) and refresh
+        // map-size tracking from the on-disk database. The existing map size is preserved.
         m_db.reset();
         m_db_params.cache_bytes = new_cache_size;
         m_db_params.wipe_data = false;
@@ -183,7 +183,7 @@ std::unique_ptr<CCoinsViewCursor> CCoinsViewDB::Cursor() const
 {
     auto i = std::make_unique<CCoinsViewDBCursor>(
         const_cast<CDBWrapper&>(*m_db).NewIterator(), GetBestBlock());
-    /* It seems that there are no "const iterators" for LevelDB.  Since we
+    /* It seems that there are no "const iterators" for the database wrapper.  Since we
        only need read operations on it, use a const-cast to get around
        that restriction.  */
     i->pcursor->Seek(DB_COIN);

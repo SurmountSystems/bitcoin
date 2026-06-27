@@ -10,6 +10,8 @@
 namespace node {
 void ReadDatabaseArgs(const ArgsManager& args, DBOptions& options)
 {
+    dbwrapper_settings::InitFromArgs(args);
+
     // Settings here apply to all databases (chainstate, blocks, and index
     // databases), but it'd be easy to parse database-specific options by adding
     // a database_type string or enum parameter to this function.

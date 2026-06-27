@@ -110,13 +110,13 @@ option(BUILD_UTIL "Build bitcoin-util executable." ${BUILD_TESTS})
 option(BUILD_UTIL_CHAINSTATE "Build experimental bitcoin-chainstate executable." OFF)
 option(BUILD_KERNEL_LIB "Build experimental bitcoinkernel library." ${BUILD_UTIL_CHAINSTATE})
 
-option(WITH_SYSTEM_LEVELDB "Build with system LevelDB instead of embedded fork." OFF)
-mark_as_advanced(WITH_SYSTEM_LEVELDB)
-if(WITH_SYSTEM_LEVELDB)
-  find_package(LevelDB MODULE REQUIRED)
+option(WITH_SYSTEM_LMDB "Build with system LMDB instead of embedded copy." OFF)
+mark_as_advanced(WITH_SYSTEM_LMDB)
+if(WITH_SYSTEM_LMDB)
+  find_package(LMDB MODULE REQUIRED)
 else()
-  set(EMBEDDED_LEVELDB TRUE)
-endif()  # WITH_SYSTEM_LEVELDB
+  set(EMBEDDED_LMDB TRUE)
+endif()  # WITH_SYSTEM_LMDB
 
 option(WITH_SYSTEM_LIBSECP256K1 "Build with system libsecp256k1 instead of embedded copy." OFF)
 mark_as_advanced(WITH_SYSTEM_LIBSECP256K1)

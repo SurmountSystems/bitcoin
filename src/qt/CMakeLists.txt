@@ -281,7 +281,7 @@ target_link_libraries(bitcoinqt
   PRIVATE
     core_interface
     bitcoin_cli
-    leveldb
+    lmdb
     Boost::headers
     $<TARGET_NAME_IF_EXISTS:MiniUPnPc::MiniUPnPc>
     $<TARGET_NAME_IF_EXISTS:QRencode::QRencode>

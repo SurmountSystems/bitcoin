@@ -47,16 +47,18 @@ Chain option                     | Data directory path
 Subdirectory       | File(s)               | Description
 -------------------|-----------------------|------------
 `blocks/`          |                       | Blocks directory; can be specified by `-blocksdir` option (except for `blocks/index/`)
-`blocks/index/`    | LevelDB database      | Block index; `-blocksdir` option does not affect this path
+`blocks/index/`    | LMDB database (`data.mdb`, `lock.mdb`) | Block index; `-blocksdir` option does not affect this path
 `blocks/`          | `blkNNNNN.dat`<sup>[\[2\]](#note2)</sup> | Actual Bitcoin blocks (network format, optionally zstd-compressed per block; 128 MiB per file)
 `share/swords/`    | `blk.dict`            | Default zstd dictionary for `blk*.dat` block compression (override with `-blockzstddict`)
 `blocks/`          | `revNNNNN.dat`<sup>[\[2\]](#note2)</sup> | Block undo data (custom format)
 `blocks/`          | `xor.dat`             | Rolling XOR pattern for block and undo data files
-`chainstate/`      | LevelDB database      | Blockchain state (a compact representation of all currently unspent transaction outputs (UTXOs) and metadata about the transactions they are from)
-`indexes/txindex/` | LevelDB database      | Transaction index; *optional*, used if `-txindex=1`
-`indexes/blockfilter/basic/db/` | LevelDB database      | Blockfilter index LevelDB database for the basic filtertype; *optional*, used if `-blockfilterindex=basic`
+`chainstate/`      | LMDB database (`data.mdb`, `lock.mdb`) | Blockchain state (a compact representation of all currently unspent transaction outputs (UTXOs) and metadata about the transactions they are from)
+`*.leveldb.bak/`   | Legacy LevelDB backup directory | Created when a pre-Swords LevelDB database is migrated to LMDB (e.g. `chainstate.leveldb.bak/`, `blocks/index.leveldb.bak/`, `indexes/txindex.leveldb.bak/`). Remove manually after verifying the migration. To roll back, delete the LMDB directory and rename the backup back to the original path.
+`*.lmdb-migrate-tmp/` | Temporary LMDB migration workspace | Present only during an in-progress migration; removed on success or failure
+`indexes/txindex/` | LMDB database (`data.mdb`, `lock.mdb`) | Transaction index; *optional*, used if `-txindex=1`
+`indexes/blockfilter/basic/db/` | LMDB database (`data.mdb`, `lock.mdb`) | Blockfilter index database for the basic filtertype; *optional*, used if `-blockfilterindex=basic`
 `indexes/blockfilter/basic/`    | `fltrNNNNN.dat`<sup>[\[2\]](#note2)</sup> | Blockfilter index filters for the basic filtertype; *optional*, used if `-blockfilterindex=basic`
-`indexes/coinstats/db/` | LevelDB database | Coinstats index; *optional*, used if `-coinstatsindex=1`
+`indexes/coinstats/db/` | LMDB database (`data.mdb`, `lock.mdb`) | Coinstats index; *optional*, used if `-coinstatsindex=1`
 `wallets/`         |                       | [Contains wallets](#multi-wallet-environment); can be specified by `-walletdir` option; if `wallets/` subdirectory does not exist, wallets reside in the [data directory](#data-directory-location)
 `./`               | `anchors.dat`         | Anchor IP address database, created on shutdown and deleted at startup. Anchors are last known outgoing block-relay-only peers that are tried to re-connect to on startup
 `./`               | `banlist.json`        | Stores the addresses/subnets of banned nodes.

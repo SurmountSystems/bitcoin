@@ -141,7 +141,7 @@ target_link_libraries(fuzz
   bitcoin_cli
   bitcoin_common
   bitcoin_util
-  leveldb
+  lmdb
   univalue
   secp256k1
   Boost::headers

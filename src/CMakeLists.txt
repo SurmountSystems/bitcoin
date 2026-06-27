@@ -15,10 +15,11 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 # These need to be included before CMAKE_*_OUTPUT_DIRECTORY variables
 # are set, so output locations of subproject tests and libraries are
 # not overridden.
-if(NOT WITH_SYSTEM_LEVELDB)
+if(NOT WITH_SYSTEM_LMDB)
+include(../cmake/lmdb.cmake)
+endif()  # WITH_SYSTEM_LMDB
 include(../cmake/crc32c.cmake)
-include(../cmake/leveldb.cmake)
-endif()  # WITH_SYSTEM_LEVELDB
+include(../cmake/leveldb_migration.cmake)
 
 add_subdirectory(univalue)
 
@@ -233,6 +234,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   blockfilter.cpp
   consensus/tx_verify.cpp
   dbwrapper.cpp
+  dbwrapper_leveldb_migrate.cpp
   deploymentstatus.cpp
   flatfile.cpp
   headerssync.cpp
@@ -331,7 +333,8 @@ target_link_libraries(bitcoin_node
     bitcoin_util
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
     zstd
-    leveldb
+    lmdb
+    leveldb_migration
     univalue
     Boost::headers
     $<TARGET_NAME_IF_EXISTS:libevent::core>

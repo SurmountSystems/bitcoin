@@ -221,6 +221,10 @@ bool GetLogCategory(BCLog::LogFlags& flag, std::string_view str)
         flag = BCLog::ALL;
         return true;
     }
+    if (str == "lmdb") {
+        flag = BCLog::LEVELDB;
+        return true;
+    }
     auto it = LOG_CATEGORIES_BY_STR.find(str);
     if (it != LOG_CATEGORIES_BY_STR.end()) {
         flag = it->second;
