@@ -9,6 +9,7 @@
 #include <index/disktxpos.h>
 #include <logging.h>
 #include <node/blockstorage.h>
+#include <streams.h>
 #include <validation.h>
 
 constexpr uint8_t DB_TXINDEX{'t'};
@@ -79,16 +80,18 @@ bool TxIndex::FindTx(const uint256& tx_hash, uint256& block_hash, CTransactionRe
         return false;
     }
 
-    AutoFile file{m_chainstate->m_blockman.OpenBlockFile(postx, true)};
-    if (file.IsNull()) {
-        LogError("%s: OpenBlockFile failed\n", __func__);
+    std::vector<uint8_t> block_data;
+    const FlatFilePos block_pos{postx.nFile, postx.nPos};
+    if (!m_chainstate->m_blockman.ReadRawBlock(block_data, block_pos)) {
+        LogError("%s: ReadRawBlock failed\n", __func__);
         return false;
     }
     CBlockHeader header;
     try {
-        file >> header;
-        file.seek(postx.nTxOffset, SEEK_CUR);
-        file >> TX_WITH_WITNESS(tx);
+        SpanReader reader{block_data};
+        reader >> header;
+        reader.ignore(postx.nTxOffset);
+        reader >> TX_WITH_WITNESS(tx);
     } catch (const std::exception& e) {
         LogError("%s: Deserialize or I/O error - %s\n", __func__, e.what());
         return false;

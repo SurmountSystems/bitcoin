@@ -48,6 +48,8 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <compress/zstd.h>
+#include <kernel/blockmanager_opts.h>
 #include <node/blockmanager_args.h>
 #include <node/blockstorage.h>
 #include <node/caches.h>
@@ -499,6 +501,21 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                              "set, and random for a freshly initialized blocksdir. "
                              "(default: %u)",
                              kernel::DEFAULT_XOR_BLOCKSDIR),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockzstd",
+                   strprintf("Enable zstd dictionary compression for new block writes to blk*.dat (default: %u)",
+                             kernel::DEFAULT_BLOCK_ZSTD),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockzstdlevel=<n>",
+                   strprintf("zstd compression level for block files (1-%d, default: %d)",
+                             compress::BlockZstd::MAX_LEVEL, kernel::DEFAULT_BLOCK_ZSTD_LEVEL),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockzstddict=<path>",
+                   "Path to zstd dictionary for block file compression (default: bundled share/swords/blk.dict)",
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockzstddecompress",
+                   strprintf("Allow reading zstd-compressed blocks from blk*.dat (default: %u)",
+                             kernel::DEFAULT_BLOCK_ZSTD_DECOMPRESS),
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-fastprune", "Use smaller block files and lower minimum prune height for testing purposes", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
 #if HAVE_SYSTEM

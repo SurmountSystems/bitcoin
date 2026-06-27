@@ -4,7 +4,10 @@
 
 #include <node/blockstorage.h>
 
+#include <compress/zstd.h>
+#include <node/blockfile_format.h>
 #include <arith_uint256.h>
+#include <consensus/consensus.h>
 #include <chain.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
@@ -1013,7 +1016,42 @@ FlatFilePos BlockManager::FindNextBlockPos(unsigned int nAddSize, unsigned int n
     return pos;
 }
 
-void BlockManager::UpdateBlockInfo(const CBlock& block, unsigned int nHeight, const FlatFilePos& pos)
+static compress::BlockZstd InitBlockZstd(const BlockManager::Options& opts)
+{
+    if (!opts.block_zstd && !opts.block_zstd_decompress) {
+        return {};
+    }
+
+    fs::path dict_path{opts.block_zstd_dict};
+    if (dict_path.empty()) {
+        dict_path = compress::DefaultBlockDictionaryPath();
+    }
+
+    if (dict_path.empty()) {
+        LogWarning("Block zstd dictionary path is not configured; compression and decompression are disabled\n");
+        return {};
+    }
+
+    const auto dictionary{compress::LoadDictionaryFile(dict_path)};
+    if (!dictionary) {
+        LogWarning("Failed to load block zstd dictionary from %s; compression and decompression are disabled\n",
+                   fs::PathToString(dict_path));
+        return {};
+    }
+
+    compress::BlockZstd zstd{*dictionary};
+    if (!zstd) {
+        LogWarning("Failed to initialize block zstd dictionary from %s; compression and decompression are disabled\n",
+                   fs::PathToString(dict_path));
+        return {};
+    }
+
+    LogInfo("Loaded block zstd dictionary (%s bytes) from %s\n", dictionary->size(), fs::PathToString(dict_path));
+    return zstd;
+}
+
+void BlockManager::UpdateBlockInfo(const CBlock& block, unsigned int nHeight, const FlatFilePos& pos,
+                                   const std::optional<unsigned int> on_disk_payload_size)
 {
     LOCK(cs_LastBlockFile);
 
@@ -1025,7 +1063,8 @@ void BlockManager::UpdateBlockInfo(const CBlock& block, unsigned int nHeight, co
     }
 
     // Update the file information with the current block.
-    const unsigned int added_size = ::GetSerializeSize(TX_WITH_WITNESS(block));
+    const unsigned int added_size{on_disk_payload_size.value_or(
+        static_cast<unsigned int>(::GetSerializeSize(TX_WITH_WITNESS(block))))};
     const int nFile = pos.nFile;
     if (static_cast<int>(m_blockfile_info.size()) <= nFile) {
         m_blockfile_info.resize(nFile + 1);
@@ -1083,7 +1122,7 @@ bool BlockManager::WriteBlockUndo(const CBlockUndo& blockundo, BlockValidationSt
 
         // Write index header
         fileout << GetParams().MessageStart() << blockundo_size;
-        pos.nPos += BLOCK_SERIALIZATION_HEADER_SIZE;
+        pos.nPos += BLOCK_LEGACY_SERIALIZATION_HEADER_SIZE;
             {
                 // Calculate checksum
                 HashWriter hasher{};
@@ -1175,17 +1214,18 @@ bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index, const bool
 
 bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& pos, const bool lowprio) const
 {
-    if (pos.nPos < BLOCK_SERIALIZATION_HEADER_SIZE) {
-        // If nPos is less than BLOCK_SERIALIZATION_HEADER_SIZE, we can't read the header that precedes the block data
-        // This would cause an unsigned integer underflow when trying to position the file cursor
-        // This can happen after pruning or default constructed positions
+    if (pos.nPos < BLOCK_LEGACY_SERIALIZATION_HEADER_SIZE) {
+        // If nPos is less than the legacy header size, we can't read the header that precedes the block data.
+        // This would cause an unsigned integer underflow when trying to position the file cursor.
+        // This can happen after pruning or default constructed positions.
         LogError("%s: OpenBlockFile failed for %s\n", __func__, pos.ToString());
         return false;
     }
 
     IOPRIO_IDLER(lowprio);
 
-    AutoFile filein{OpenBlockFile({pos.nFile, pos.nPos - BLOCK_SERIALIZATION_HEADER_SIZE}, /*fReadOnly=*/true)};
+    const uint32_t probe_size{std::min(pos.nPos, BLOCK_SERIALIZATION_HEADER_SIZE)};
+    AutoFile filein{OpenBlockFile({pos.nFile, pos.nPos - probe_size}, /*fReadOnly=*/true)};
     if (filein.IsNull()) {
         LogError("%s: OpenBlockFile failed for %s\n", __func__, pos.ToString());
         return false;
@@ -1194,26 +1234,38 @@ bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& 
     if (lowprio) filein.SetIdlePriority();
 
     try {
-        MessageStartChars blk_start;
-        unsigned int blk_size;
+        std::vector<uint8_t> header_bytes(probe_size);
+        filein.read(MakeWritableByteSpan(header_bytes));
 
-        filein >> blk_start >> blk_size;
-
-        if (blk_start != GetParams().MessageStart()) {
-            LogError("%s: Block magic mismatch for %s: %s versus expected %s\n", __func__, pos.ToString(),
-                         HexStr(blk_start),
-                         HexStr(GetParams().MessageStart()));
+        BlockDiskHeader header;
+        if (!ParseBlockDiskHeader(GetParams(), pos.nPos, header_bytes, header)) {
+            LogError("%s: Failed to parse block header for %s\n", __func__, pos.ToString());
             return false;
         }
 
-        if (blk_size > MAX_SIZE) {
-            LogError("%s: Block data is larger than maximum deserialization size for %s: %s versus %s\n", __func__, pos.ToString(),
-                         blk_size, MAX_SIZE);
+        if (!CompressedBlockReadAllowed(header, m_opts.block_zstd_decompress)) {
+            LogError("%s: Compressed block at %s but -blockzstddecompress=0\n", __func__, pos.ToString());
             return false;
         }
 
-        block.resize(blk_size); // Zeroing of memory is intentional here
-        filein.read(MakeWritableByteSpan(block));
+        std::vector<uint8_t> stored;
+        stored.resize(header.stored_size);
+        filein.read(MakeWritableByteSpan(stored));
+
+        if (BlockDiskPayloadIsCompressed(header)) {
+            if (!m_block_zstd.Decompress(stored, block, MAX_BLOCK_SERIALIZED_SIZE)) {
+                LogError("%s: Failed to decompress block at %s\n", __func__, pos.ToString());
+                return false;
+            }
+        } else {
+            block = std::move(stored);
+        }
+
+        if (block.size() > MAX_BLOCK_SERIALIZED_SIZE) {
+            LogError("%s: Block data is larger than maximum deserialization size for %s: %s versus %s\n", __func__,
+                     pos.ToString(), block.size(), MAX_BLOCK_SERIALIZED_SIZE);
+            return false;
+        }
     } catch (const std::exception& e) {
         LogError("%s: Read from block file failed: %s for %s\n", __func__, e.what(), pos.ToString());
         return false;
@@ -1222,10 +1274,33 @@ bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& 
     return true;
 }
 
+bool BlockManager::DecompressBlockPayload(std::span<const uint8_t> compressed, std::vector<uint8_t>& payload) const
+{
+    return m_block_zstd.Decompress(compressed, payload, MAX_BLOCK_SERIALIZED_SIZE);
+}
+
 FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)
 {
-    const unsigned int block_size{static_cast<unsigned int>(GetSerializeSize(TX_WITH_WITNESS(block)))};
-    FlatFilePos pos{FindNextBlockPos(block_size + BLOCK_SERIALIZATION_HEADER_SIZE, nHeight, block.GetBlockTime())};
+    std::vector<uint8_t> payload;
+    VectorWriter{payload, 0} << TX_WITH_WITNESS(block);
+
+    uint8_t flags{0};
+    Span<const uint8_t> stored_payload{payload};
+    std::vector<uint8_t> compressed;
+    const bool use_extended_header{m_opts.block_zstd};
+    const uint32_t header_size{use_extended_header ? BLOCK_SERIALIZATION_HEADER_SIZE :
+                                                     BLOCK_LEGACY_SERIALIZATION_HEADER_SIZE};
+
+    if (use_extended_header && m_block_zstd) {
+        if (m_block_zstd.Compress(payload, compressed, m_opts.block_zstd_level) &&
+            compressed.size() < payload.size()) {
+            flags |= BLOCK_SERIALIZATION_FLAG_COMPRESSED;
+            stored_payload = compressed;
+        }
+    }
+
+    const unsigned int stored_size{static_cast<unsigned int>(stored_payload.size())};
+    FlatFilePos pos{FindNextBlockPos(stored_size + header_size, nHeight, block.GetBlockTime())};
     if (pos.IsNull()) {
         LogError("FindNextBlockPos failed for %s while writing block", pos.ToString());
         return FlatFilePos();
@@ -1239,11 +1314,14 @@ FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)
     {
         BufferedWriter fileout{file};
 
-    // Write index header
-    fileout << GetParams().MessageStart() << block_size;
-    // Write block
-    pos.nPos += BLOCK_SERIALIZATION_HEADER_SIZE;
-    fileout << TX_WITH_WITNESS(block);
+        fileout << GetParams().MessageStart();
+        if (use_extended_header) {
+            fileout << flags << stored_size;
+        } else {
+            fileout << stored_size;
+        }
+        pos.nPos += header_size;
+        fileout.write(AsBytes(stored_payload));
     }
 
     if (file.fclose() != 0) {
@@ -1315,6 +1393,7 @@ static auto InitBlocksdirXorKey(const BlockManager::Options& opts)
 BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
     : m_prune_mode{opts.prune_target > 0},
       m_xor_key{InitBlocksdirXorKey(opts)},
+      m_block_zstd{InitBlockZstd(opts)},
       m_opts{std::move(opts)},
       m_block_file_seq{FlatFileSeq{m_opts.blocks_dir, "blk", m_opts.fast_prune ? 0x4000 /* 16kB */ : BLOCKFILE_CHUNK_SIZE}},
       m_undo_file_seq{FlatFileSeq{m_opts.blocks_dir, "rev", UNDOFILE_CHUNK_SIZE}},
@@ -1329,6 +1408,15 @@ BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
         if (m_prune_mode) {
             CleanupBlockRevFiles();
         }
+    }
+
+    if (m_opts.block_zstd && !m_block_zstd) {
+        LogWarning("Block zstd compression is enabled (-blockzstd=1) but no dictionary is loaded; "
+                   "new blocks will be written with extended headers without compression\n");
+    }
+    if (m_opts.block_zstd_decompress && !m_block_zstd) {
+        LogWarning("Block zstd decompression is enabled (-blockzstddecompress=1) but no dictionary is loaded; "
+                   "compressed blocks on disk cannot be read\n");
     }
 }
 
@@ -1358,7 +1446,7 @@ void ImportBlocks(ChainstateManager& chainman, std::span<const fs::path> import_
         int nFile = 0;
         // Map of disk positions for blocks with unknown parent (only used for reindex);
         // parent hash -> child disk position, multiple children can have the same parent.
-        std::multimap<uint256, FlatFilePos> blocks_with_unknown_parent;
+        std::multimap<uint256, OutOfOrderBlockDiskEntry> blocks_with_unknown_parent;
         while (true) {
             FlatFilePos pos(nFile, 0);
             if (!fs::exists(chainman.m_blockman.GetBlockPosFilename(pos))) {

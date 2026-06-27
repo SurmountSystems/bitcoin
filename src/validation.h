@@ -887,6 +887,13 @@ enum class SnapshotCompletionResult {
  *    IBD process is happening in the background while use of the
  *    active (snapshot) chainstate allows the rest of the system to function.
  */
+
+/** Disk location of a block encountered during reindex before its parent is known. */
+struct OutOfOrderBlockDiskEntry {
+    FlatFilePos pos;
+    std::optional<unsigned int> on_disk_payload_size;
+};
+
 class ChainstateManager
 {
 private:
@@ -1205,7 +1212,7 @@ public:
      * Because a block's parent may be in a later file, not just later in the same file, the
      * blocks_with_unknown_parent map must be passed in and out with each call. It's a multimap,
      * rather than just a map, because multiple blocks may have the same parent (when chain splits
-     * or stale blocks exist). It maps from parent-hash to child-disk-position.
+     * or stale blocks exist). It maps from parent-hash to child on-disk entry.
      *
      * This function can also be used to read blocks from user-specified block files using the
      * -loadblock= option. There's no unknown-parent tracking, so the last two arguments are omitted.
@@ -1220,7 +1227,7 @@ public:
     void LoadExternalBlockFile(
         AutoFile& file_in,
         FlatFilePos* dbp = nullptr,
-        std::multimap<uint256, FlatFilePos>* blocks_with_unknown_parent = nullptr);
+        std::multimap<uint256, OutOfOrderBlockDiskEntry>* blocks_with_unknown_parent = nullptr);
 
     /**
      * Process an incoming block. This only returns after the best known valid
@@ -1280,7 +1287,7 @@ public:
      *
      * @returns   False if the block or header is invalid, or if saving to disk fails (likely a fatal error); true otherwise.
      */
-    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked, std::optional<unsigned int> on_disk_payload_size = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 

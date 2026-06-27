@@ -7,6 +7,8 @@
 
 #include <attributes.h>
 #include <chain.h>
+#include <compress/zstd.h>
+#include <node/blockfile_format.h>
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <kernel/blockmanager_opts.h>
@@ -80,11 +82,8 @@ static const unsigned int UNDOFILE_CHUNK_SIZE = 0x100000; // 1 MiB
 /** The maximum size of a blk?????.dat file (since 0.8) */
 static const unsigned int MAX_BLOCKFILE_SIZE = 0x8000000; // 128 MiB
 
-/** Size of header written by WriteBlock before a serialized CBlock (8 bytes) */
-static constexpr uint32_t BLOCK_SERIALIZATION_HEADER_SIZE{std::tuple_size_v<MessageStartChars> + sizeof(unsigned int)};
-
 /** Total overhead when writing undo data: header (8 bytes) plus checksum (32 bytes) */
-static constexpr uint32_t UNDO_DATA_DISK_OVERHEAD{BLOCK_SERIALIZATION_HEADER_SIZE + uint256::size()};
+static constexpr uint32_t UNDO_DATA_DISK_OVERHEAD{BLOCK_LEGACY_SERIALIZATION_HEADER_SIZE + uint256::size()};
 
 // Because validation code takes pointers to the map's CBlockIndex objects, if
 // we ever switch to another associative container, we need to either use a
@@ -255,6 +254,8 @@ private:
 
     const Obfuscation m_xor_key;
 
+    compress::BlockZstd m_block_zstd;
+
     /** Dirty block index entries. */
     std::set<CBlockIndex*> m_dirty_blockindex;
 
@@ -363,8 +364,14 @@ public:
      * @param[in]  block        the block being processed
      * @param[in]  nHeight      the height of the block
      * @param[in]  pos          the position of the serialized CBlock on disk
+     * @param[in]  on_disk_payload_size  Optional on-disk payload size when it differs from the
+     *                                   serialized size (e.g. zstd-compressed during reindex).
      */
-    void UpdateBlockInfo(const CBlock& block, unsigned int nHeight, const FlatFilePos& pos);
+    void UpdateBlockInfo(const CBlock& block, unsigned int nHeight, const FlatFilePos& pos,
+                         std::optional<unsigned int> on_disk_payload_size = std::nullopt);
+
+    /** Whether reading zstd-compressed block payloads is allowed (-blockzstddecompress). */
+    [[nodiscard]] bool AllowsBlockZstdDecompress() const { return m_opts.block_zstd_decompress; }
 
     /** Whether running in -prune mode. */
     [[nodiscard]] bool IsPruneMode() const { return m_prune_mode; }
@@ -441,6 +448,9 @@ public:
     bool ReadBlock(CBlock& block, const FlatFilePos& pos, const std::optional<uint256>& expected_hash = {}, bool lowprio = false) const;
     bool ReadBlock(CBlock& block, const CBlockIndex& index, bool lowprio = false) const;
     bool ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& pos, bool lowprio = false) const;
+
+    /** Decompress a zstd-compressed block payload. Returns false if unavailable or invalid. */
+    bool DecompressBlockPayload(std::span<const uint8_t> compressed, std::vector<uint8_t>& payload) const;
 
     bool ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const;
 

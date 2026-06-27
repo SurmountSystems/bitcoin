@@ -5,9 +5,12 @@
 #include <node/blockmanager_args.h>
 
 #include <common/args.h>
+#include <compress/zstd.h>
+#include <kernel/blockmanager_opts.h>
 #include <node/blockstorage.h>
 #include <node/database_args.h>
 #include <tinyformat.h>
+#include <util/fs.h>
 #include <util/result.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -62,6 +65,19 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, BlockManager::Op
     }
 
     if (auto value{args.GetBoolArg("-fastprune")}) opts.fast_prune = *value;
+
+    if (auto value{args.GetBoolArg("-blockzstd")}) opts.block_zstd = *value;
+    if (auto value{args.GetIntArg("-blockzstdlevel")}) {
+        if (*value < compress::BlockZstd::MIN_LEVEL || *value > compress::BlockZstd::MAX_LEVEL) {
+            return util::Error{strprintf(_("Invalid level for -blockzstdlevel (%d); must be between %d and %d."),
+                                         *value, compress::BlockZstd::MIN_LEVEL, compress::BlockZstd::MAX_LEVEL)};
+        }
+        opts.block_zstd_level = *value;
+    }
+    if (auto value{args.GetBoolArg("-blockzstddecompress")}) opts.block_zstd_decompress = *value;
+    if (const auto dict_arg{args.GetArg("-blockzstddict")}) {
+        opts.block_zstd_dict = fs::u8path(*dict_arg);
+    }
 
     ReadDatabaseArgs(args, opts.block_tree_db_params.options);
 

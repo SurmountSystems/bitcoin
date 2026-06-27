@@ -33,6 +33,7 @@
 #include <kernel/warning.h>
 #include <logging.h>
 #include <logging/timer.h>
+#include <node/blockfile_format.h>
 #include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
 #include <policy/coin_age_priority.h>
@@ -92,6 +93,7 @@ using kernel::Notifications;
 using fsbridge::FopenFn;
 using node::BlockManager;
 using node::BlockMap;
+using node::ParseBlockDiskHeaderAfterMagic;
 using node::CBlockIndexHeightOnlyComparator;
 using node::CBlockIndexWorkComparator;
 using node::SnapshotMetadata;
@@ -4905,7 +4907,7 @@ void ChainstateManager::ReportHeadersPresync(const arith_uint256& work, int64_t 
 }
 
 /** Store block on disk. If dbp is non-nullptr, the file is known to already reside on disk */
-bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked)
+bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked, const std::optional<unsigned int> on_disk_payload_size)
 {
     const CBlock& block = *pblock;
 
@@ -4979,7 +4981,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         FlatFilePos blockPos{};
         if (dbp) {
             blockPos = *dbp;
-            m_blockman.UpdateBlockInfo(block, pindex->nHeight, blockPos);
+            m_blockman.UpdateBlockInfo(block, pindex->nHeight, blockPos, on_disk_payload_size);
         } else {
             blockPos = m_blockman.WriteBlock(block, pindex->nHeight);
             if (blockPos.IsNull()) {
@@ -5510,7 +5512,7 @@ bool Chainstate::LoadGenesisBlock()
 void ChainstateManager::LoadExternalBlockFile(
     AutoFile& file_in,
     FlatFilePos* dbp,
-    std::multimap<uint256, FlatFilePos>* blocks_with_unknown_parent)
+    std::multimap<uint256, OutOfOrderBlockDiskEntry>* blocks_with_unknown_parent)
 {
     // Either both should be specified (-reindex), or neither (-loadblock).
     assert(!dbp == !blocks_with_unknown_parent);
@@ -5523,7 +5525,7 @@ void ChainstateManager::LoadExternalBlockFile(
         IOPRIO_IDLER(/*lowprio=*/true);
         file_in.SetIdlePriority();
 
-        BufferedFile blkdat{file_in, 2 * MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE + 8};
+        BufferedFile blkdat{file_in, 2 * MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE + node::BLOCK_SERIALIZATION_HEADER_SIZE};
         // nRewind indicates where to resume scanning in case something goes wrong,
         // such as a block fails to deserialize.
         uint64_t nRewind = blkdat.GetPos();
@@ -5534,6 +5536,8 @@ void ChainstateManager::LoadExternalBlockFile(
             nRewind++; // start one byte further next time, in case of failure
             blkdat.SetLimit(); // remove former limit
             unsigned int nSize = 0;
+            uint32_t payload_offset{0};
+            node::BlockDiskHeader disk_header;
             try {
                 // locate a header
                 MessageStartChars buf;
@@ -5543,23 +5547,54 @@ void ChainstateManager::LoadExternalBlockFile(
                 if (buf != params.MessageStart()) {
                     continue;
                 }
-                // read size
-                blkdat >> nSize;
-                if (nSize < 80 || nSize > MAX_BLOCK_SERIALIZED_SIZE)
+                const uint64_t magic_pos{blkdat.GetPos() - sizeof(MessageStartChars)};
+                std::array<uint8_t, 4> post_magic4{};
+                blkdat.read(MakeWritableByteSpan(post_magic4));
+                std::array<uint8_t, 5> post_magic5{};
+                std::copy(post_magic4.begin(), post_magic4.end(), post_magic5.begin());
+                bool parsed{ParseBlockDiskHeaderAfterMagic(params, magic_pos, post_magic4, disk_header, payload_offset)};
+                if (!parsed && post_magic4.size() >= 1 && node::ValidBlockDiskFlags(post_magic4[0])) {
+                    blkdat.read(MakeWritableByteSpan(post_magic5).subspan(4, 1));
+                    parsed = ParseBlockDiskHeaderAfterMagic(params, magic_pos, post_magic5, disk_header, payload_offset);
+                }
+                if (!parsed) {
                     continue;
+                }
+                nSize = disk_header.stored_size;
             } catch (const std::exception&) {
                 // no valid block header found; don't complain
                 // (this happens at the end of every blk.dat file)
                 break;
             }
             try {
-                // read block header
-                const uint64_t nBlockPos{blkdat.GetPos()};
+                const uint64_t nBlockPos{payload_offset};
                 if (dbp)
                     dbp->nPos = nBlockPos;
+                if (blkdat.GetPos() != nBlockPos) {
+                    blkdat.SetPos(nBlockPos);
+                }
                 blkdat.SetLimit(nBlockPos + nSize);
+                std::vector<uint8_t> stored(nSize);
+                blkdat.read(MakeWritableByteSpan(stored));
+
+                std::vector<uint8_t> payload;
+                if (node::BlockDiskPayloadIsCompressed(disk_header)) {
+                    if (!node::CompressedBlockReadAllowed(disk_header, m_blockman.AllowsBlockZstdDecompress())) {
+                        LogPrintf("[reindex] Compressed block at offset %u in blk%05u.dat but -blockzstddecompress=0\n",
+                                  payload_offset, dbp ? dbp->nFile : 0);
+                        continue;
+                    }
+                    if (!m_blockman.DecompressBlockPayload(stored, payload)) {
+                        LogPrintf("[reindex] Failed to decompress block at offset %u in blk%05u.dat (stored size %u)\n",
+                                  payload_offset, dbp ? dbp->nFile : 0, nSize);
+                        continue;
+                    }
+                } else {
+                    payload = std::move(stored);
+                }
+
                 CBlockHeader header;
-                blkdat >> header;
+                SpanReader{payload} >> header;
                 const uint256 hash{header.GetHash()};
                 // Skip the rest of this block (this may read from disk into memory); position to the marker before the
                 // next block, but it's still possible to rewind to the start of the current block (without a disk read).
@@ -5575,7 +5610,8 @@ void ChainstateManager::LoadExternalBlockFile(
                         LogDebug(BCLog::REINDEX, "%s: Out of order block %s, parent %s not known\n", __func__, hash.ToString(),
                                  header.hashPrevBlock.ToString());
                         if (dbp && blocks_with_unknown_parent) {
-                            blocks_with_unknown_parent->emplace(header.hashPrevBlock, *dbp);
+                            blocks_with_unknown_parent->emplace(header.hashPrevBlock,
+                                                                  OutOfOrderBlockDiskEntry{*dbp, disk_header.stored_size});
                         }
                         continue;
                     }
@@ -5583,14 +5619,12 @@ void ChainstateManager::LoadExternalBlockFile(
                     // process in case the block isn't known yet
                     const CBlockIndex* pindex = m_blockman.LookupBlockIndex(hash);
                     if (!pindex || (pindex->nStatus & BLOCK_HAVE_DATA) == 0) {
-                        // This block can be processed immediately; rewind to its start, read and deserialize it.
-                        blkdat.SetPos(nBlockPos);
+                        // This block can be processed immediately; deserialize from the already-read payload.
                         pblock = std::make_shared<CBlock>();
-                        blkdat >> TX_WITH_WITNESS(*pblock);
-                        nRewind = blkdat.GetPos();
+                        SpanReader{payload} >> TX_WITH_WITNESS(*pblock);
 
                         BlockValidationState state;
-                        if (AcceptBlock(pblock, state, nullptr, true, dbp, nullptr, true)) {
+                        if (AcceptBlock(pblock, state, nullptr, true, dbp, nullptr, true, disk_header.stored_size)) {
                             nLoaded++;
                         }
                         if (state.IsError()) {
@@ -5649,14 +5683,14 @@ void ChainstateManager::LoadExternalBlockFile(
                     queue.pop_front();
                     auto range = blocks_with_unknown_parent->equal_range(head);
                     while (range.first != range.second) {
-                        std::multimap<uint256, FlatFilePos>::iterator it = range.first;
+                        std::multimap<uint256, OutOfOrderBlockDiskEntry>::iterator it = range.first;
                         std::shared_ptr<CBlock> pblockrecursive = std::make_shared<CBlock>();
-                        if (m_blockman.ReadBlock(*pblockrecursive, it->second)) {
+                        if (m_blockman.ReadBlock(*pblockrecursive, it->second.pos)) {
                             LogDebug(BCLog::REINDEX, "%s: Processing out of order child %s of %s\n", __func__, pblockrecursive->GetHash().ToString(),
                                     head.ToString());
                             LOCK(cs_main);
                             BlockValidationState dummy;
-                            if (AcceptBlock(pblockrecursive, dummy, nullptr, true, &it->second, nullptr, true)) {
+                            if (AcceptBlock(pblockrecursive, dummy, nullptr, true, &it->second.pos, nullptr, true, it->second.on_disk_payload_size)) {
                                 nLoaded++;
                                 queue.push_back(pblockrecursive->GetHash());
                             }

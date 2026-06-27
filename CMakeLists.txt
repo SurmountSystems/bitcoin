@@ -203,6 +203,8 @@ if(WITH_ZMQ)
   find_package(ZeroMQ 4.0.0 MODULE REQUIRED)
 endif()
 
+find_package(Zstd MODULE REQUIRED)
+
 option(WITH_USDT "Enable tracepoints for Userspace, Statically Defined Tracing." OFF)
 if(WITH_USDT)
   find_package(USDT MODULE REQUIRED)
@@ -289,6 +291,13 @@ target_link_libraries(core_interface INTERFACE
   $<$<CONFIG:RelWithDebInfo>:core_interface_relwithdebinfo>
   $<$<CONFIG:Debug>:core_interface_debug>
 )
+
+target_compile_definitions(core_interface INTERFACE
+  BLOCK_ZSTD_DICT_SOURCE_PATH="${PROJECT_SOURCE_DIR}/share/swords/blk.dict"
+  BLOCK_ZSTD_DICT_INSTALL_PATH="${CMAKE_INSTALL_PREFIX}/share/swords/blk.dict"
+)
+
+install(FILES share/swords/blk.dict DESTINATION share/swords)
 
 if(BUILD_FOR_FUZZING)
   message(WARNING "BUILD_FOR_FUZZING=ON will disable all other targets and force BUILD_FUZZ_BINARY=ON.")

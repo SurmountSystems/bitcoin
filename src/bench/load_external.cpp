@@ -61,7 +61,7 @@ static void LoadExternalBlockFile(benchmark::Bench& bench)
         fclose(file);
     }
 
-    std::multimap<uint256, FlatFilePos> blocks_with_unknown_parent;
+    std::multimap<uint256, OutOfOrderBlockDiskEntry> blocks_with_unknown_parent;
     FlatFilePos pos;
     bench.run([&] {
         // "rb" is "binary, O_RDONLY", positioned to the start of the file.

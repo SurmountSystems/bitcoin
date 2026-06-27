@@ -17,6 +17,10 @@ namespace kernel {
 
 static constexpr bool DEFAULT_XOR_BLOCKSDIR{true};
 
+static constexpr bool DEFAULT_BLOCK_ZSTD{true};
+static constexpr int DEFAULT_BLOCK_ZSTD_LEVEL{20};
+static constexpr bool DEFAULT_BLOCK_ZSTD_DECOMPRESS{true};
+
 /**
  * An options struct for `BlockManager`, more ergonomically referred to as
  * `BlockManager::Options` due to the using-declaration in `BlockManager`.
@@ -30,6 +34,10 @@ struct BlockManagerOpts {
     const fs::path blocks_dir;
     Notifications& notifications;
     DBParams block_tree_db_params;
+    bool block_zstd{DEFAULT_BLOCK_ZSTD};
+    int block_zstd_level{DEFAULT_BLOCK_ZSTD_LEVEL};
+    bool block_zstd_decompress{DEFAULT_BLOCK_ZSTD_DECOMPRESS};
+    fs::path block_zstd_dict{};
 };
 
 } // namespace kernel

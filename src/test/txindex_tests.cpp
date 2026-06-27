@@ -4,13 +4,20 @@
 
 #include <addresstype.h>
 #include <chainparams.h>
+#include <consensus/consensus.h>
 #include <index/txindex.h>
 #include <interfaces/chain.h>
+#include <node/blockfile_format.h>
+#include <node/blockstorage.h>
+#include <script/script.h>
 #include <test/util/index.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <array>
+#include <vector>
 
 BOOST_AUTO_TEST_SUITE(txindex_tests)
 
@@ -74,6 +81,55 @@ BOOST_FIXTURE_TEST_CASE(txindex_initial_sync, TestChain100Setup)
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
     // shutdown sequence (c.f. Shutdown() in init.cpp)
+    txindex.Stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(txindex_findtx_compressed_block, TestChain100Setup)
+{
+    TxIndex txindex(interfaces::MakeChain(m_node), 1 << 20, true);
+    BOOST_REQUIRE(txindex.Init());
+    BOOST_REQUIRE(txindex.StartBackgroundSync());
+    IndexWaitSynced(txindex, *Assert(m_node.shutdown_signal));
+
+    const CMutableTransaction tx{CreateValidMempoolTransaction(
+        m_coinbase_txns[0], 0, COINBASE_MATURITY, coinbaseKey,
+        CScript() << OP_RETURN << std::vector<uint8_t>(2048, 0x42),
+        1 * COIN,
+        false)};
+
+    const CScript coinbase_script_pub_key = GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
+    const CBlock block = CreateAndProcessBlock({tx}, coinbase_script_pub_key);
+
+    const CBlockIndex* pindex;
+    {
+        LOCK(cs_main);
+        pindex = m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash());
+        BOOST_REQUIRE(pindex);
+        BOOST_REQUIRE(pindex->nStatus & BLOCK_HAVE_DATA);
+    }
+
+    // Verify the block was stored with a compressed on-disk payload when possible.
+    {
+        const FlatFilePos block_pos{pindex->GetBlockPos()};
+        const uint32_t probe_size{node::BLOCK_SERIALIZATION_HEADER_SIZE};
+        AutoFile file{m_node.chainman->m_blockman.OpenBlockFile({block_pos.nFile, block_pos.nPos - probe_size}, /*fReadOnly=*/true)};
+        BOOST_REQUIRE(!file.IsNull());
+        std::array<uint8_t, node::BLOCK_SERIALIZATION_HEADER_SIZE> header_bytes{};
+        file.read(MakeWritableByteSpan(header_bytes));
+        node::BlockDiskHeader disk_header;
+        BOOST_REQUIRE(node::ParseBlockDiskHeader(Params(), block_pos.nPos, header_bytes, disk_header));
+        BOOST_CHECK((disk_header.flags & node::BLOCK_SERIALIZATION_FLAG_COMPRESSED) != 0);
+    }
+
+    IndexWaitSynced(txindex, *Assert(m_node.shutdown_signal));
+
+    CTransactionRef tx_disk;
+    uint256 block_hash;
+    BOOST_REQUIRE(txindex.FindTx(tx.GetHash(), block_hash, tx_disk));
+    BOOST_CHECK_EQUAL(tx_disk->GetHash(), tx.GetHash());
+    BOOST_CHECK_EQUAL(block_hash, block.GetHash());
+
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
     txindex.Stop();
 }
 

@@ -256,6 +256,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   net_processing.cpp
   netgroup.cpp
   node/abort.cpp
+  compress/zstd.cpp
+  node/blockfile_format.cpp
   node/blockmanager_args.cpp
   node/blockstorage.cpp
   node/caches.cpp
@@ -328,6 +330,7 @@ target_link_libraries(bitcoin_node
     bitcoin_common
     bitcoin_util
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
+    zstd
     leveldb
     univalue
     Boost::headers
