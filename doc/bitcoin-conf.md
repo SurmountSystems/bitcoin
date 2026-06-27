@@ -90,3 +90,73 @@ To use the generated configuration file, copy the example file into your data di
 # example copy command for linux user
 cp share/examples/bitcoin.conf ~/.bitcoin
 ```
+
+## Bitcoin Swords options
+
+Bitcoin Swords extends Knots with storage and cache options for high-RAM full nodes. These are **local implementation changes only** — not a consensus fork. See [design/swords.md](design/swords.md) for architecture and status.
+
+### Block file zstd compression
+
+Per-block zstd dictionary compression for `blk*.dat`. Compression is applied to plaintext before XOR obfuscation. Legacy 8-byte block headers remain readable.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `blockzstd` | `1` | Enable zstd compression for new block writes |
+| `blockzstdlevel` | `20` | zstd compression level (1–22) |
+| `blockzstddict` | install-prefix `share/swords/blk.dict` | Path to block compression dictionary |
+| `blockzstddecompress` | `1` | Allow reading zstd-compressed blocks (set `0` only for debugging) |
+
+Compression is skipped when no dictionary loads or when compressed size would not be smaller than plaintext. Setting `blockzstd=0` disables the extended 9-byte header and writes new blocks with the legacy 8-byte format.
+
+### Database backend (LMDB)
+
+All chain index and UTXO databases use LMDB (`data.mdb` + `lock.mdb` per directory). Legacy LevelDB directories are migrated automatically on first startup.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `migrateleveldb` | `1` | Automatically migrate legacy LevelDB directories to LMDB |
+| `dbmapsize` | `0` | Explicit LMDB map size for chainstate databases in MiB (`0` = derive from `-dbcache`) |
+
+After migration, the old LevelDB directory is renamed to `*.leveldb.bak/` (e.g. `chainstate.leveldb.bak/`). Remove the backup after verifying the node runs correctly.
+
+### Cache sizing
+
+Raised auto `-dbcache` cap (48 GiB on 64-bit; 32-bit builds retain a 2 GiB cap). Separate profiles for IBD and synced operation. Bounds match upstream: minimum 4 MiB, automatic floor 100 MiB when unset on low-RAM systems.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `dbcache` | platform auto | Total cache budget in MiB; explicit value disables auto-shrink on IBD exit |
+| `dbcache-ibd` | `0` (auto ~62.5% usable RAM) | Cache budget while initial block download is active |
+| `dbcache-synced` | `0` (auto ~25% usable RAM) | Cache budget after IBD completes |
+| `reservedram` | `2048` | MiB reserved for non-dbcache usage in automatic cache formulas |
+| `coinscache` | `0` (computed) | Override in-memory UTXO tip cache in MiB |
+| `coinsdbcache` | `0` (computed) | Override chainstate DB / LMDB reader budget in MiB |
+| `blocktreecache` | `0` (computed) | Override block index DB cache in MiB |
+
+**Auto-shrink:** When `-dbcache` is not set and the IBD profile exceeds the synced profile, caches reduce automatically when IBD completes.
+
+**Example (96 GiB RAM):**
+
+```ini
+reservedram=4096
+dbcache-ibd=49152
+# Conservative override; auto synced ≈ 23 GiB with 96 GiB RAM and reservedram=4096
+dbcache-synced=16384
+migrateleveldb=1
+```
+
+### UTXO zstd compression
+
+zstd dictionary compression for UTXO values at the LMDB storage boundary. The in-memory coins tip cache holds deserialized coins; compression cost is paid on cache miss and flush.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `utxozstd` | `1` | Enable zstd compression for UTXO values in chainstate |
+| `utxozstdlevel` | `20` | zstd compression level (1–22) |
+| `utxozstddict` | install-prefix `share/swords/utxo.dict` | Path to UTXO compression dictionary |
+
+New writes store legacy raw serialized `Coin` bytes when uncompressed, or `0x01 0x01` + zstd payload when compression wins. The `0x01 0x00` prefix is supported for reading but is not written by current code. Legacy and migrated entries remain readable.
+
+### Dictionary files
+
+Bundled dictionaries ship under the binary install prefix at `share/swords/blk.dict` and `share/swords/utxo.dict` (not in the datadir). They are bootstrap placeholders; for best compression ratios on mainnet, train dictionaries from representative block and chainstate samples (see [design/swords.md](design/swords.md)).

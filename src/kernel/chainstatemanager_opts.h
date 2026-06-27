@@ -9,6 +9,7 @@
 
 #include <arith_uint256.h>
 #include <dbwrapper.h>
+#include <kernel/caches.h>
 #include <script/sigcache.h>
 #include <txdb.h>
 #include <uint256.h>
@@ -44,6 +45,10 @@ struct ChainstateManagerOpts {
     std::chrono::seconds max_tip_age{DEFAULT_MAX_TIP_AGE};
     DBOptions coins_db{};
     CoinsViewOptions coins_view{};
+    //! Target kernel cache split after IBD completes (when auto-shrink is enabled).
+    kernel::CacheSizes synced_cache_sizes{};
+    //! When true, shrink toward synced_cache_sizes when IBD flips to false.
+    bool shrink_cache_on_ibd_exit{false};
     Notifications& notifications;
     ValidationSignals* signals{nullptr};
     //! Number of script check worker threads. Zero means no parallel verification.

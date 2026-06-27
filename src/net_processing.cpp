@@ -5538,6 +5538,9 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 
     MaybeSendSendHeaders(*pto, *peer);
 
+    std::optional<node::BlockReadLoc> pending_cmpct_block_read;
+    std::optional<CBlockHeader> pending_cmpct_header_fallback;
+
     {
         LOCK(cs_main);
 
@@ -5681,11 +5684,8 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     if (cached_cmpctblock_msg.has_value()) {
                         PushMessage(*pto, std::move(cached_cmpctblock_msg.value()));
                     } else {
-                        CBlock block;
-                        const bool ret{m_chainman.m_blockman.ReadBlock(block, *pBestIndex, /*lowprio=*/true)};
-                        assert(ret);
-                        CBlockHeaderAndShortTxIDs cmpctblock{block, m_rng.rand64()};
-                        MakeAndPushMessage(*pto, NetMsgType::CMPCTBLOCK, cmpctblock);
+                        pending_cmpct_block_read = m_chainman.m_blockman.CopyBlockReadLocAssumingLockHeld(*pBestIndex);
+                        pending_cmpct_header_fallback = pBestIndex->GetBlockHeader();
                     }
                     state.pindexBestHeaderSent = pBestIndex;
                 } else if (peer->m_prefers_headers) {
@@ -5985,6 +5985,18 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         if (!vGetData.empty())
             MakeAndPushMessage(*pto, NetMsgType::GETDATA, vGetData);
     } // release cs_main
+
+    if (pending_cmpct_block_read && pending_cmpct_block_read->IsValid()) {
+        CBlock block;
+        if (m_chainman.m_blockman.ReadBlock(block, pending_cmpct_block_read->pos, pending_cmpct_block_read->hash, /*lowprio=*/true)) {
+            CBlockHeaderAndShortTxIDs cmpctblock{block, m_rng.rand64()};
+            MakeAndPushMessage(*pto, NetMsgType::CMPCTBLOCK, cmpctblock);
+        } else if (pending_cmpct_header_fallback) {
+            LogDebug(BCLog::NET, "%s: cmpctblock read failed, falling back to headers for peer=%d\n", __func__, pto->GetId());
+            MakeAndPushMessage(*pto, NetMsgType::HEADERS, TX_WITH_WITNESS(std::vector<CBlockHeader>{*pending_cmpct_header_fallback}));
+        }
+    }
+
     MaybeSendFeefilter(*pto, *peer, current_time);
     return true;
 }

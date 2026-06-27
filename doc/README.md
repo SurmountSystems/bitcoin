@@ -1,5 +1,7 @@
-Bitcoin Knots
-=============
+Bitcoin Knots / Bitcoin Swords
+============================
+
+This tree includes **Bitcoin Swords**, a Knots fork with zstd block/UTXO compression, an LMDB database backend, and expanded caches for high-RAM nodes. See [design/swords.md](design/swords.md) for architecture, options, and implementation status.
 
 Setup
 ---------------------
@@ -63,7 +65,7 @@ The Bitcoin repo's [root README](/README.md) contains relevant information on th
 - [Dnsseed Policy](dnsseed-policy.md)
 - [Benchmarking](benchmarking.md)
 - [Internal Design Docs](design/)
-- [Bitcoin Swords (planned fork)](design/swords.md)
+- [**Bitcoin Swords**](design/swords.md) — Knots fork with zstd block/UTXO compression, LMDB backend, and expanded caches for high-RAM nodes
 
 ### Resources
 * Discuss on the [BitcoinTalk](https://bitcointalk.org/) forums, in the [Development & Technical Discussion board](https://bitcointalk.org/index.php?board=6.0).

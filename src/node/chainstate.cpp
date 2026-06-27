@@ -136,7 +136,12 @@ static ChainstateLoadResult CompleteChainstateInitialization(
     // Now that chainstates are loaded and we're able to flush to
     // disk, rebalance the coins caches to desired levels based
     // on the condition of each chainstate.
-    chainman.MaybeRebalanceCaches();
+    chainman.UpdateIBDStatus();
+    if (!chainman.IsInitialBlockDownload() && chainman.m_shrink_cache_on_ibd_exit) {
+        chainman.ApplySyncedCacheProfile();
+    } else {
+        chainman.MaybeRebalanceCaches();
+    }
 
     return {ChainstateLoadStatus::SUCCESS, {}};
 }

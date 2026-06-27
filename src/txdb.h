@@ -7,6 +7,7 @@
 #define BITCOIN_TXDB_H
 
 #include <coins.h>
+#include <compress/zstd.h>
 #include <dbwrapper.h>
 #include <kernel/cs_main.h>
 #include <sync.h>
@@ -24,6 +25,9 @@ class uint256;
 //! -dbbatchsize default (bytes)
 static const int64_t nDefaultDbBatchSize = 64 << 20;
 
+static constexpr bool DEFAULT_UTXO_ZSTD{true};
+static constexpr int DEFAULT_UTXO_ZSTD_LEVEL{20};
+
 //! User-controlled performance and debug options.
 struct CoinsViewOptions {
     //! Maximum database write batch size in bytes.
@@ -31,6 +35,12 @@ struct CoinsViewOptions {
     //! If non-zero, randomly exit when the database is flushed with (1/ratio)
     //! probability.
     int simulate_crash_ratio = 0;
+    //! Enable zstd dictionary compression for new UTXO writes.
+    bool utxo_zstd{DEFAULT_UTXO_ZSTD};
+    //! zstd compression level for UTXO storage.
+    int utxo_zstd_level{DEFAULT_UTXO_ZSTD_LEVEL};
+    //! Optional override path for the UTXO zstd dictionary.
+    std::optional<fs::path> utxo_zstd_dict_path;
 };
 
 /** CCoinsView backed by the coin database (chainstate/)
@@ -42,6 +52,11 @@ protected:
     DBParams m_db_params;
     CoinsViewOptions m_options;
     std::unique_ptr<CDBWrapper> m_db;
+    compress::UtxoZstd m_utxo_zstd;
+
+    bool ReadCoinValue(const COutPoint& outpoint, Coin& coin) const;
+    void WriteCoinValue(CDBBatch& batch, const COutPoint& outpoint, const Coin& coin);
+
 public:
     explicit CCoinsViewDB(DBParams db_params, CoinsViewOptions options);
 
@@ -56,7 +71,7 @@ public:
     bool NeedsUpgrade();
     size_t EstimateSize() const override;
 
-    //! Dynamically alter the underlying leveldb cache size.
+    //! Dynamically alter the underlying LMDB reader pool / environment tuning.
     void ResizeCache(size_t new_cache_size) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     //! @returns filesystem path to on-disk storage or std::nullopt if in memory.

@@ -855,13 +855,15 @@ void CheckBlockDataAvailability(BlockManager& blockman, const CBlockIndex& block
 
 static CBlock GetBlockChecked(BlockManager& blockman, const CBlockIndex& blockindex)
 {
-    CBlock block;
+    node::BlockReadLoc loc{};
     {
         LOCK(cs_main);
         CheckBlockDataAvailability(blockman, blockindex, /*check_for_undo=*/false);
+        loc = blockman.CopyBlockReadLocAssumingLockHeld(blockindex);
     }
 
-    if (!blockman.ReadBlock(block, blockindex)) {
+    CBlock block;
+    if (!loc.IsValid() || !blockman.ReadBlock(block, loc.pos, loc.hash)) {
         // Block not found on disk. This shouldn't normally happen unless the block was
         // pruned right after we released the lock above.
         throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk");
@@ -873,14 +875,14 @@ static CBlock GetBlockChecked(BlockManager& blockman, const CBlockIndex& blockin
 static std::vector<uint8_t> GetRawBlockChecked(BlockManager& blockman, const CBlockIndex& blockindex)
 {
     std::vector<uint8_t> data{};
-    FlatFilePos pos{};
+    node::BlockReadLoc loc{};
     {
         LOCK(cs_main);
         CheckBlockDataAvailability(blockman, blockindex, /*check_for_undo=*/false);
-        pos = blockindex.GetBlockPos();
+        loc = blockman.CopyBlockReadLocAssumingLockHeld(blockindex);
     }
 
-    if (!blockman.ReadRawBlock(data, pos)) {
+    if (!loc.IsValid() || !blockman.ReadRawBlock(data, loc.pos)) {
         // Block not found on disk. This shouldn't normally happen unless the block was
         // pruned right after we released the lock above.
         throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk");
@@ -896,12 +898,14 @@ static CBlockUndo GetUndoChecked(BlockManager& blockman, const CBlockIndex& bloc
     // The Genesis block does not have undo data
     if (blockindex.nHeight == 0) return blockUndo;
 
+    node::UndoReadLoc loc{};
     {
         LOCK(cs_main);
         CheckBlockDataAvailability(blockman, blockindex, /*check_for_undo=*/true);
+        loc = blockman.CopyUndoReadLocAssumingLockHeld(blockindex);
     }
 
-    if (!blockman.ReadBlockUndo(blockUndo, blockindex)) {
+    if (!loc.IsValid() || !blockman.ReadBlockUndo(blockUndo, loc)) {
         throw JSONRPCError(RPC_MISC_ERROR, "Can't read undo data from disk");
     }
 
@@ -2812,7 +2816,8 @@ static RPCHelpMan scantxoutset()
             ChainstateManager& chainman = EnsureChainman(node);
             LOCK(cs_main);
             Chainstate& active_chainstate = chainman.ActiveChainstate();
-            active_chainstate.ForceFlushStateToDisk();
+            BlockValidationState state;
+            active_chainstate.FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
             pcursor = CHECK_NONFATAL(active_chainstate.CoinsDB().Cursor());
             tip = CHECK_NONFATAL(active_chainstate.m_chain.Tip());
         }
@@ -3739,7 +3744,8 @@ PrepareUTXOSnapshot(
         //
         AssertLockHeld(::cs_main);
 
-        chainstate.ForceFlushStateToDisk();
+        BlockValidationState state;
+        chainstate.FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
 
         maybe_stats = GetUTXOStats(&chainstate.CoinsDB(), chainstate.m_blockman, CoinStatsHashType::HASH_SERIALIZED, interruption_point);
         if (!maybe_stats) {

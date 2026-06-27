@@ -6,7 +6,9 @@ There are a few parameters that can be dialed down to reduce the memory usage of
 
 The size of some in-memory caches can be reduced. As caches trade off memory usage for performance, reducing these will usually have a negative effect on performance.
 
-- `-dbcache=<n>` - the UTXO database cache size, this defaults to `450`. The unit is MiB (1024).
+- `-dbcache=<n>` - the UTXO database cache size. The unit is MiB (1024).
+  - On **Bitcoin Swords**, when `-dbcache` is unset, the default is the automatic **IBD profile** (~62.5% of usable RAM, capped at 48 GiB on 64-bit), not the upstream `450` MiB default. See [Bitcoin Swords — higher cache limits](#bitcoin-swords--higher-cache-limits) below.
+  - On upstream Knots/Core, this defaults to `450`.
   - The minimum value for `-dbcache` is 4.
   - A lower `-dbcache` makes initial sync time much longer. After the initial sync, the effect is less pronounced for most use-cases, unless fast validation of blocks is important, such as for mining.
 
@@ -52,3 +54,30 @@ bitcoind
 ```
 
 The behavior was introduced to increase CPU locality of allocated memory and performance with concurrent allocation, so this setting could in theory reduce performance. However, in Bitcoin Core very little parallel allocation happens, so the impact is expected to be small or absent.
+
+## Bitcoin Swords — higher cache limits
+
+Bitcoin Swords raises the automatic `-dbcache` cap to **48 GiB** on 64-bit systems (32-bit builds retain a 2 GiB cap). Upstream Knots/Core caps at 2 GiB. On high-RAM machines this lets the node keep a much larger in-memory UTXO cache, which speeds up block validation significantly.
+
+Swords also provides separate IBD and synced cache profiles:
+
+- **During IBD** (default auto: ~62.5% of usable RAM): aggressive cache for faster initial sync.
+- **After IBD** (default auto: ~25% of usable RAM): reduced cache unless you set `-dbcache` explicitly.
+
+When `-dbcache` is **not** set explicitly and the IBD profile is larger than the synced profile, caches shrink automatically when IBD completes. The log line starts with `IBD complete; reducing cache from X MiB to Y MiB` and includes per-component breakdown (coinstip, coinsdb, blocktree).
+
+### Swords-specific options
+
+| Option | Purpose |
+|--------|---------|
+| `-dbcache-ibd=<n>` | Override IBD cache budget (MiB); `0` = auto |
+| `-dbcache-synced=<n>` | Override post-IBD cache budget (MiB); `0` = auto |
+| `-reservedram=<n>` | MiB reserved for OS/wallet/mempool in auto formulas (default: 2048) |
+| `-coinscache=<n>` | Override in-memory UTXO tip cache directly |
+| `-coinsdbcache=<n>` | Override chainstate LMDB reader budget |
+| `-blocktreecache=<n>` | Override block index cache |
+| `-dbmapsize=<n>` | Explicit LMDB map size for chainstate (MiB) |
+
+To **reduce** memory on a Swords node, use the same techniques as above (`-dbcache`, `-maxmempool`, `-blocksonly`, etc.) but note that the minimum and default ranges are much higher. Set `-dbcache` explicitly to a lower value (e.g. `450` or `2048`) to match upstream behavior and disable automatic IBD→synced shrinking.
+
+See [design/swords.md](design/swords.md) and [bitcoin-conf.md](bitcoin-conf.md#bitcoin-swords-options) for full option documentation.

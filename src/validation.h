@@ -695,6 +695,12 @@ public:
         FlushStateMode mode,
         int nManualPruneHeight = 0);
 
+    //! @see FlushStateToDisk. Caller must hold cs_main (exactly once; no nested acquire).
+    bool FlushStateToDiskLocked(
+        BlockValidationState& state,
+        FlushStateMode mode,
+        int nManualPruneHeight = 0) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     //! Unconditionally flush all changes to disk.
     void ForceFlushStateToDisk();
 
@@ -1104,6 +1110,13 @@ public:
     //! coins databases. This will be split somehow across chainstates.
     size_t m_total_coinsdb_cache{0};
 
+    //! Target coins caches after IBD completes (when auto-shrink is enabled).
+    kernel::CacheSizes m_synced_cache_sizes{};
+    //! Whether to shrink caches when IBD flips from true to false.
+    bool m_shrink_cache_on_ibd_exit{false};
+    //! Whether the synced cache profile has already been applied.
+    bool m_synced_cache_profile_applied{false};
+
     //! Instantiate a new chainstate.
     //!
     //! @param[in] mempool              The mempool to pass to the chainstate
@@ -1306,6 +1319,9 @@ public:
     //! Check to see if caches are out of balance and if so, call
     //! ResizeCoinsCaches() as needed.
     void MaybeRebalanceCaches() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    //! Shrink caches toward the synced profile after IBD completes.
+    void ApplySyncedCacheProfile() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** Update uncommitted block structures (currently: only the witness reserved value). This is safe for submitted blocks. */
     void UpdateUncommittedBlockStructures(CBlock& block, const CBlockIndex* pindexPrev) const;

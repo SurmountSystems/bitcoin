@@ -3128,49 +3128,68 @@ bool Chainstate::FlushStateToDisk(
     int nManualPruneHeight)
 {
     LOCK(cs_main);
-    assert(this->CanFlushToDisk());
+    return FlushStateToDiskLocked(state, mode, nManualPruneHeight);
+}
+
+bool Chainstate::FlushStateToDiskLocked(
+    BlockValidationState &state,
+    FlushStateMode mode,
+    int nManualPruneHeight)
+{
+    AssertLockHeld(cs_main);
     std::set<int> setFilesToPrune;
     bool full_flush_completed = false;
-
-    const size_t coins_count = CoinsTip().GetCacheSize();
-    const size_t coins_mem_usage = CoinsTip().DynamicMemoryUsage();
+    bool should_write = false;
+    bool fFlushForPrune = false;
+    bool fCacheLarge = false;
+    bool fCacheCritical = false;
+    int tip_height = 0;
+    node::BlockIndexWriteBatch block_index_batch;
+    size_t coins_count = 0;
+    size_t coins_mem_usage = 0;
+    bool flush_coins = false;
+    bool empty_cache = false;
+    NodeClock::time_point flush_start{};
+    CBlockLocator locator_on_flush;
+    ChainstateRole role_on_flush{ChainstateRole::NORMAL};
 
     try {
-    {
-        bool fFlushForPrune = false;
+        assert(this->CanFlushToDisk());
 
         CoinsCacheSizeState cache_state = GetCoinsCacheSizeState();
-        LOCK(m_blockman.cs_LastBlockFile);
-        if (m_blockman.IsPruneMode() && (m_blockman.m_check_for_pruning || nManualPruneHeight > 0) && m_chainman.m_blockman.m_blockfiles_indexed) {
-            // make sure we don't prune above any of the prune locks bestblocks
-            // pruning is height-based
-            int last_prune{m_chain.Height()}; // last height we can prune
+        {
+            LOCK(m_blockman.cs_LastBlockFile);
+            if (m_blockman.IsPruneMode() && (m_blockman.m_check_for_pruning || nManualPruneHeight > 0) && m_chainman.m_blockman.m_blockfiles_indexed) {
+                // make sure we don't prune above any of the prune locks bestblocks
+                // pruning is height-based
+                int last_prune{m_chain.Height()}; // last height we can prune
 
-            if (nManualPruneHeight > 0) {
-                LOG_TIME_MILLIS_WITH_CATEGORY("find files to prune (manual)", BCLog::BENCH);
+                if (nManualPruneHeight > 0) {
+                    LOG_TIME_MILLIS_WITH_CATEGORY("find files to prune (manual)", BCLog::BENCH);
 
-                m_blockman.FindFilesToPruneManual(
-                    setFilesToPrune,
-                    std::min(last_prune, nManualPruneHeight),
-                    *this, m_chainman);
-            } else {
-                LOG_TIME_MILLIS_WITH_CATEGORY("find files to prune", BCLog::BENCH);
+                    m_blockman.FindFilesToPruneManual(
+                        setFilesToPrune,
+                        std::min(last_prune, nManualPruneHeight),
+                        *this, m_chainman);
+                } else {
+                    LOG_TIME_MILLIS_WITH_CATEGORY("find files to prune", BCLog::BENCH);
 
-                m_blockman.FindFilesToPrune(setFilesToPrune, last_prune, *this, m_chainman);
-                m_blockman.m_check_for_pruning = false;
-            }
-            if (!setFilesToPrune.empty()) {
-                fFlushForPrune = true;
-                if (!m_blockman.m_have_pruned) {
-                    m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true);
-                    m_blockman.m_have_pruned = true;
+                    m_blockman.FindFilesToPrune(setFilesToPrune, last_prune, *this, m_chainman);
+                    m_blockman.m_check_for_pruning = false;
+                }
+                if (!setFilesToPrune.empty()) {
+                    fFlushForPrune = true;
+                    if (!m_blockman.m_have_pruned) {
+                        m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true);
+                        m_blockman.m_have_pruned = true;
+                    }
                 }
             }
         }
         const auto nNow{NodeClock::now()};
         // The cache is large and we're within 10% and 10 MiB of the limit, but we have time now (not in the middle of a block processing).
-        bool fCacheLarge = mode == FlushStateMode::PERIODIC && cache_state >= CoinsCacheSizeState::LARGE;
-        bool fCacheCritical = false;
+        fCacheLarge = mode == FlushStateMode::PERIODIC && cache_state >= CoinsCacheSizeState::LARGE;
+        fCacheCritical = false;
         if (mode == FlushStateMode::IF_NEEDED) {
             if (cache_state >= CoinsCacheSizeState::CRITICAL) {
                 // The cache is over the limit, we have to write now.
@@ -3182,78 +3201,102 @@ bool Chainstate::FlushStateToDisk(
         // It's been a while since we wrote the block index and chain state to disk. Do this frequently, so we don't need to redownload or reindex after a crash.
         bool fPeriodicWrite = mode == FlushStateMode::PERIODIC && nNow >= m_next_write;
         // Combine all conditions that result in a write to disk.
-        bool should_write = (mode == FlushStateMode::ALWAYS) || fCacheLarge || fCacheCritical || fPeriodicWrite || fFlushForPrune;
-        // Write blocks, block index and best chain related state to disk.
+        should_write = (mode == FlushStateMode::ALWAYS) || fCacheLarge || fCacheCritical || fPeriodicWrite || fFlushForPrune;
         if (should_write) {
             // Ensure we can write block index
             if (!CheckDiskSpace(m_blockman.m_opts.blocks_dir)) {
                 return FatalError(m_chainman.GetNotifications(), state, _("Disk space is too low!"));
             }
-            {
-                LOG_TIME_MILLIS_WITH_CATEGORY("write block and undo data to disk", BCLog::BENCH);
-
-                // First make sure all block and undo data is flushed to disk.
-                // TODO: Handle return error, or add detailed comment why it is
-                // safe to not return an error upon failure.
-                if (!m_blockman.FlushChainstateBlockFile(m_chain.Height())) {
-                    LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "%s: Failed to flush block file.\n", __func__);
-                }
-            }
-
-            // Then update all block file information (which may refer to block and undo files).
-            {
-                LOG_TIME_MILLIS_WITH_CATEGORY("write block index to disk", BCLog::BENCH);
-
-                if (!m_blockman.WriteBlockIndexDB()) {
-                    return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to block index database."));
-                }
-            }
-            // Finally remove any pruned files
-            if (fFlushForPrune) {
-                LOG_TIME_MILLIS_WITH_CATEGORY("unlink pruned files", BCLog::BENCH);
-
-                m_blockman.UnlinkPrunedFiles(setFilesToPrune);
-            }
-
-            if (!CoinsTip().GetBestBlock().IsNull()) {
-
-            if (coins_mem_usage >= WARN_FLUSH_COINS_SIZE) LogWarning("Flushing large (%d GiB) UTXO set to disk, it may take several minutes", coins_mem_usage >> 30);
-            LOG_TIME_MILLIS_WITH_CATEGORY(strprintf("write coins cache to disk (%d coins, %.2fKiB)",
-                coins_count, coins_mem_usage >> 10), BCLog::BENCH);
-
-            // Typical Coin structures on disk are around 48 bytes in size.
-            // Pushing a new one to the database can cause it to be written
-            // twice (once in the log, and once in the tables). This is already
-            // an overestimation, as most will delete an existing entry or
-            // overwrite one. Still, use a conservative safety factor of 2.
-            if (!CheckDiskSpace(m_chainman.m_options.datadir, 48 * 2 * 2 * CoinsTip().GetCacheSize())) {
-                return FatalError(m_chainman.GetNotifications(), state, _("Disk space is too low!"));
-            }
-            // Flush the chainstate (which may refer to block index entries).
-            const auto empty_cache{(mode == FlushStateMode::ALWAYS) || fCacheLarge || fCacheCritical};
-            if (empty_cache ? !CoinsTip().Flush() : !CoinsTip().Sync()) {
-                return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
-            }
-            full_flush_completed = true;
-            TRACEPOINT(utxocache, flush,
-                    int64_t{Ticks<std::chrono::microseconds>(NodeClock::now() - nNow)},
-                   (uint32_t)mode,
-                   (uint64_t)coins_count,
-                   (uint64_t)coins_mem_usage,
-                   (bool)fFlushForPrune);
-
-            }
+            flush_start = nNow;
         }
 
         if (should_write || m_next_write == NodeClock::time_point::max()) {
             constexpr auto range{DATABASE_WRITE_INTERVAL_MAX - DATABASE_WRITE_INTERVAL_MIN};
             m_next_write = FastRandomContext().rand_uniform_delay(NodeClock::now() + DATABASE_WRITE_INTERVAL_MIN, range);
         }
-    }
-    if (full_flush_completed && m_chainman.m_options.signals) {
-        // Update best block in wallet (so we can detect restored wallets).
-        m_chainman.m_options.signals->ChainStateFlushed(this->GetRole(), m_chain.GetLocator());
-    }
+
+        if (should_write) {
+            tip_height = m_chain.Height();
+            block_index_batch = m_blockman.PrepareBlockIndexWriteBatch();
+            coins_count = CoinsTip().GetCacheSize();
+            coins_mem_usage = CoinsTip().DynamicMemoryUsage();
+            flush_coins = !CoinsTip().GetBestBlock().IsNull();
+            empty_cache = (mode == FlushStateMode::ALWAYS) || fCacheLarge || fCacheCritical;
+            if (flush_coins) {
+                // Typical Coin structures on disk are around 48 bytes in size.
+                // Pushing a new one to the database can cause it to be written
+                // twice (once in the log, and once in the tables). This is already
+                // an overestimation, as most will delete an existing entry or
+                // overwrite one. Still, use a conservative safety factor of 2.
+                if (!CheckDiskSpace(m_chainman.m_options.datadir, 48 * 2 * 2 * coins_count)) {
+                    return FatalError(m_chainman.GetNotifications(), state, _("Disk space is too low!"));
+                }
+            }
+        }
+
+        if (should_write) {
+            // Release cs_main during block-index I/O. Snapshot already taken above; never
+            // acquire cs_main while holding m_cs_block_index_write (lock-order inversion).
+            LEAVE_CRITICAL_SECTION(cs_main);
+
+            {
+                LOG_TIME_MILLIS_WITH_CATEGORY("write block and undo data to disk", BCLog::BENCH);
+
+                // First make sure all block and undo data is flushed to disk.
+                // TODO: Handle return error, or add detailed comment why it is
+                // safe to not return an error upon failure.
+                if (!m_blockman.FlushChainstateBlockFile(tip_height)) {
+                    LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "%s: Failed to flush block file.\n", __func__);
+                }
+            }
+
+            bool block_index_written{false};
+            {
+                LOCK(m_blockman.m_cs_block_index_write);
+                LOG_TIME_MILLIS_WITH_CATEGORY("write block index to disk", BCLog::BENCH);
+                block_index_written = m_blockman.WriteBlockIndexBatch(block_index_batch);
+            }
+
+            if (block_index_written) {
+                LOCK(cs_main);
+                m_blockman.CommitBlockIndexWriteBatch(block_index_batch);
+            } else {
+                ENTER_CRITICAL_SECTION(cs_main);
+                return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to block index database."));
+            }
+
+            ENTER_CRITICAL_SECTION(cs_main);
+
+            if (fFlushForPrune) {
+                LOG_TIME_MILLIS_WITH_CATEGORY("unlink pruned files", BCLog::BENCH);
+
+                m_blockman.UnlinkPrunedFiles(setFilesToPrune);
+            }
+
+            if (flush_coins) {
+                if (coins_mem_usage >= WARN_FLUSH_COINS_SIZE) LogWarning("Flushing large (%d GiB) UTXO set to disk, it may take several minutes", coins_mem_usage >> 30);
+                LOG_TIME_MILLIS_WITH_CATEGORY(strprintf("write coins cache to disk (%d coins, %.2fKiB)",
+                    coins_count, coins_mem_usage >> 10), BCLog::BENCH);
+
+                if (empty_cache ? !CoinsTip().Flush() : !CoinsTip().Sync()) {
+                    return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
+                }
+                full_flush_completed = true;
+                role_on_flush = GetRole();
+                locator_on_flush = m_chain.GetLocator();
+                TRACEPOINT(utxocache, flush,
+                        int64_t{Ticks<std::chrono::microseconds>(NodeClock::now() - flush_start)},
+                       (uint32_t)mode,
+                       (uint64_t)coins_count,
+                       (uint64_t)coins_mem_usage,
+                       (bool)fFlushForPrune);
+            }
+        }
+
+        if (full_flush_completed && m_chainman.m_options.signals) {
+            // Update best block in wallet (so we can detect restored wallets).
+            m_chainman.m_options.signals->ChainStateFlushed(role_on_flush, locator_on_flush);
+        }
     } catch (const std::runtime_error& e) {
         return FatalError(m_chainman.GetNotifications(), state, strprintf(_("System error while flushing: %s"), e.what()));
     }
@@ -3413,12 +3456,26 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     CBlockIndex *pindexDelete = m_chain.Tip();
     assert(pindexDelete);
     assert(pindexDelete->pprev);
-    // Read block from disk.
-    std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
-    CBlock& block = *pblock;
-    if (!m_blockman.ReadBlock(block, *pindexDelete)) {
+    // Read block from disk without holding cs_main during I/O.
+    const node::BlockReadLoc block_loc{m_blockman.CopyBlockReadLocAssumingLockHeld(*pindexDelete)};
+    if (!block_loc.IsValid()) {
         LogError("DisconnectTip(): Failed to read block\n");
         return false;
+    }
+    std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
+    CBlock& block = *pblock;
+    {
+        LEAVE_CRITICAL_SECTION(cs_main);
+        const bool read_ok{m_blockman.ReadBlock(block, block_loc.pos, block_loc.hash)};
+        ENTER_CRITICAL_SECTION(cs_main);
+        if (!read_ok) {
+            LogError("DisconnectTip(): Failed to read block\n");
+            return false;
+        }
+        if (m_chain.Tip() != pindexDelete) {
+            LogError("DisconnectTip(): Chain tip changed during block read\n");
+            return false;
+        }
     }
     // Apply the block atomically to the chain state.
     const auto time_start{SteadyClock::now()};
@@ -3448,7 +3505,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     }
 
     // Write the chain state to disk, if necessary.
-    if (!FlushStateToDisk(state, FlushStateMode::IF_NEEDED)) {
+    if (!FlushStateToDiskLocked(state, FlushStateMode::IF_NEEDED)) {
         return false;
     }
 
@@ -3538,9 +3595,21 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     const auto time_1{SteadyClock::now()};
     std::shared_ptr<const CBlock> pthisBlock;
     if (!pblock) {
-        std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
-        if (!m_blockman.ReadBlock(*pblockNew, *pindexNew)) {
+        const node::BlockReadLoc block_loc{m_blockman.CopyBlockReadLocAssumingLockHeld(*pindexNew)};
+        if (!block_loc.IsValid()) {
             return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
+        }
+        std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
+        {
+            LEAVE_CRITICAL_SECTION(cs_main);
+            const bool read_ok{m_blockman.ReadBlock(*pblockNew, block_loc.pos, block_loc.hash)};
+            ENTER_CRITICAL_SECTION(cs_main);
+            if (!read_ok) {
+                return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
+            }
+            if (pindexNew->pprev != m_chain.Tip()) {
+                return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
+            }
         }
         pthisBlock = pblockNew;
     } else {
@@ -3584,7 +3653,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
              Ticks<SecondsDouble>(m_chainman.time_flush),
              Ticks<MillisecondsDouble>(m_chainman.time_flush) / m_chainman.num_blocks_total);
     // Write the chain state to disk, if necessary.
-    if (!FlushStateToDisk(state, FlushStateMode::IF_NEEDED)) {
+    if (!FlushStateToDiskLocked(state, FlushStateMode::IF_NEEDED)) {
         return false;
     }
     const auto time_5{SteadyClock::now()};
@@ -3881,8 +3950,8 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             CBlockIndex* starting_tip = m_chain.Tip();
             bool blocks_connected = false;
             do {
-                // We absolutely may not unlock cs_main until we've made forward progress
-                // (with the exception of shutdown due to hardware issues, low disk space, etc).
+                // We may not unlock cs_main until forward progress is made, except for
+                // intentional out-of-lock block reads in ConnectTip/DisconnectTip (I/O only).
                 ConnectTrace connectTrace; // Destructed before cs_main is unlocked
 
                 if (pindexMostWork == nullptr) {
@@ -3966,7 +4035,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             // If a background chainstate is in use, we may need to rebalance our
             // allocation of caches once a chainstate exits initial block download.
             LOCK(::cs_main);
-            m_chainman.MaybeRebalanceCaches();
+            m_chainman.ApplySyncedCacheProfile();
         }
 
         // Write changes periodically to disk, after relay.
@@ -5001,7 +5070,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     // the block files may be pruned, so we can just call this on one
     // chainstate (particularly if we haven't implemented pruning with
     // background validation yet).
-    ActiveChainstate().FlushStateToDisk(state, FlushStateMode::NONE);
+    ActiveChainstate().FlushStateToDiskLocked(state, FlushStateMode::NONE);
 
     CheckBlockIndex();
 
@@ -5227,11 +5296,21 @@ VerifyDBResult CVerifyDB::VerifyDB(
             skipped_no_block_data = true;
             break;
         }
-        CBlock block;
-        // check level 0: read from disk
-        if (!chainstate.m_blockman.ReadBlock(block, *pindex, /*lowprio=*/true)) {
+        const node::BlockReadLoc block_loc{chainstate.m_blockman.CopyBlockReadLoc(*pindex)};
+        if (!block_loc.IsValid()) {
             LogError("Verification error: ReadBlock failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
             return VerifyDBResult::CORRUPTED_BLOCK_DB;
+        }
+        CBlock block;
+        // check level 0: read from disk
+        {
+            LEAVE_CRITICAL_SECTION(cs_main);
+            const bool read_ok{chainstate.m_blockman.ReadBlock(block, block_loc.pos, block_loc.hash, /*lowprio=*/true)};
+            ENTER_CRITICAL_SECTION(cs_main);
+            if (!read_ok) {
+                LogError("Verification error: ReadBlock failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
+                return VerifyDBResult::CORRUPTED_BLOCK_DB;
+            }
         }
         // check level 1: verify block validity
         if (nCheckLevel >= 1 && !CheckBlock(block, state, consensus_params)) {
@@ -5294,10 +5373,20 @@ VerifyDBResult CVerifyDB::VerifyDB(
             }
             m_notifications.progress(_("Verifying blocks…"), percentageDone, false);
             pindex = chainstate.m_chain.Next(pindex);
-            CBlock block;
-            if (!chainstate.m_blockman.ReadBlock(block, *pindex, /*lowprio=*/true)) {
+            const node::BlockReadLoc block_loc{chainstate.m_blockman.CopyBlockReadLoc(*pindex)};
+            if (!block_loc.IsValid()) {
                 LogError("Verification error: ReadBlock failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
+            }
+            CBlock block;
+            {
+                LEAVE_CRITICAL_SECTION(cs_main);
+                const bool read_ok{chainstate.m_blockman.ReadBlock(block, block_loc.pos, block_loc.hash, /*lowprio=*/true)};
+                ENTER_CRITICAL_SECTION(cs_main);
+                if (!read_ok) {
+                    LogError("Verification error: ReadBlock failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
+                    return VerifyDBResult::CORRUPTED_BLOCK_DB;
+                }
             }
             if (!chainstate.ConnectBlock(block, state, pindex, coins)) {
                 LogError("Verification error: found unconnectable block at %d, hash=%s (%s)", pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
@@ -5323,10 +5412,20 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
 {
     AssertLockHeld(cs_main);
     // TODO: merge with ConnectBlock
-    CBlock block;
-    if (!m_blockman.ReadBlock(block, *pindex, /*lowprio=*/true)) {
+    const node::BlockReadLoc block_loc{m_blockman.CopyBlockReadLoc(*pindex)};
+    if (!block_loc.IsValid()) {
         LogError("ReplayBlock(): ReadBlock failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
         return false;
+    }
+    CBlock block;
+    {
+        LEAVE_CRITICAL_SECTION(cs_main);
+        const bool read_ok{m_blockman.ReadBlock(block, block_loc.pos, block_loc.hash, /*lowprio=*/true)};
+        ENTER_CRITICAL_SECTION(cs_main);
+        if (!read_ok) {
+            LogError("ReplayBlock(): ReadBlock failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
+            return false;
+        }
     }
 
     for (const CTransactionRef& tx : block.vtx) {
@@ -6074,10 +6173,10 @@ bool Chainstate::ResizeCoinsCaches(size_t coinstip_size, size_t coinsdb_size)
 
     if (coinstip_size > old_coinstip_size) {
         // Likely no need to flush if cache sizes have grown.
-        ret = FlushStateToDisk(state, FlushStateMode::IF_NEEDED);
+        ret = FlushStateToDiskLocked(state, FlushStateMode::IF_NEEDED);
     } else {
         // Otherwise, flush state to disk and deallocate the in-memory coins map.
-        ret = FlushStateToDisk(state, FlushStateMode::ALWAYS);
+        ret = FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
     }
     return ret;
 }
@@ -6719,6 +6818,44 @@ bool ChainstateManager::IsSnapshotActive() const
     return m_snapshot_chainstate && m_active_chainstate == m_snapshot_chainstate.get();
 }
 
+void ChainstateManager::ApplySyncedCacheProfile()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_shrink_cache_on_ibd_exit || m_synced_cache_profile_applied) {
+        MaybeRebalanceCaches();
+        return;
+    }
+
+    const size_t old_coinstip{m_total_coinstip_cache};
+    const size_t old_coinsdb{m_total_coinsdb_cache};
+    const size_t old_blocktree{m_blockman.GetBlockTreeCacheSize()};
+    m_total_coinstip_cache = m_synced_cache_sizes.coins;
+    m_total_coinsdb_cache = m_synced_cache_sizes.coins_db;
+
+    LogPrintf("IBD complete; reducing cache from %zu MiB to %zu MiB "
+              "(coinstip: %.1f -> %.1f MiB, coinsdb: %.1f -> %.1f MiB, blocktree: %.1f -> %.1f MiB)\n",
+              (old_coinstip + old_coinsdb + old_blocktree) / 1_MiB,
+              (m_total_coinstip_cache + m_total_coinsdb_cache + m_synced_cache_sizes.block_tree_db) / 1_MiB,
+              old_coinstip * (1.0 / 1024 / 1024),
+              m_total_coinstip_cache * (1.0 / 1024 / 1024),
+              old_coinsdb * (1.0 / 1024 / 1024),
+              m_total_coinsdb_cache * (1.0 / 1024 / 1024),
+              old_blocktree * (1.0 / 1024 / 1024),
+              m_synced_cache_sizes.block_tree_db * (1.0 / 1024 / 1024));
+
+    BlockValidationState state;
+    if (!ActiveChainstate().FlushStateToDisk(state, FlushStateMode::IF_NEEDED)) {
+        LogWarning("Failed to flush chainstate before shrinking caches after IBD; deferring cache reduction\n");
+        m_total_coinstip_cache = old_coinstip;
+        m_total_coinsdb_cache = old_coinsdb;
+        return;
+    }
+
+    m_blockman.ResizeBlockTreeCache(m_synced_cache_sizes.block_tree_db);
+    m_synced_cache_profile_applied = true;
+    MaybeRebalanceCaches();
+}
+
 void ChainstateManager::MaybeRebalanceCaches()
 {
     AssertLockHeld(::cs_main);
@@ -6780,7 +6917,9 @@ ChainstateManager::ChainstateManager(const util::SignalInterrupt& interrupt, Opt
       m_interrupt{interrupt},
       m_options{Flatten(std::move(options))},
       m_blockman{interrupt, std::move(blockman_options)},
-      m_validation_cache{m_options.script_execution_cache_bytes, m_options.signature_cache_bytes}
+      m_validation_cache{m_options.script_execution_cache_bytes, m_options.signature_cache_bytes},
+      m_synced_cache_sizes{m_options.synced_cache_sizes},
+      m_shrink_cache_on_ibd_exit{m_options.shrink_cache_on_ibd_exit}
 {
     if (GetParams().IsTestChain()
         ? (!g_enable_rdts)

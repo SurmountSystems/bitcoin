@@ -24,6 +24,8 @@
 #include <node/blockstorage.h>
 #include <node/chainstate.h>
 #include <node/database_args.h>
+#include <node/caches.h>
+#include <node/coins_view_args.h>
 #include <node/dbcache.h>
 #include <random.h>
 #include <script/sigcache.h>
@@ -109,19 +111,25 @@ int main(int argc, char* argv[])
     };
     auto notifications = std::make_unique<KernelNotifications>();
 
-    kernel::CacheSizes cache_sizes{node::GetDefaultDBCache()};
+    ArgsManager args;
+    const node::CacheSizes all_cache_sizes{node::CalculateCacheSizes(args)};
+    const kernel::CacheSizes& cache_sizes{all_cache_sizes.kernel};
+    const auto synced_cache_sizes{node::CalculateCacheSizes(args, 0, node::DbCacheProfile::SYNCED)};
 
     DBOptions db_options{};
-    node::ReadDatabaseArgs(ArgsManager{}, db_options);
+    node::ReadDatabaseArgs(args, db_options);
 
     // SETUP: Chainstate
     auto chainparams = CChainParams::Main();
-    const ChainstateManager::Options chainman_opts{
+    ChainstateManager::Options chainman_opts{
         .chainparams = *chainparams,
         .datadir = abs_datadir,
         .notifications = *notifications,
         .signals = &validation_signals,
+        .synced_cache_sizes = synced_cache_sizes.kernel,
+        .shrink_cache_on_ibd_exit = node::ShouldShrinkCacheOnIbdExit(args),
     };
+    node::ReadCoinsViewArgs(args, chainman_opts.coins_view);
     const node::BlockManager::Options blockman_opts{
         .chainparams = chainman_opts.chainparams,
         .blocks_dir = abs_datadir / "blocks",
@@ -155,6 +163,13 @@ int main(int argc, char* argv[])
             goto epilogue;
         }
     }
+
+    WITH_LOCK(::cs_main, {
+        chainman.UpdateIBDStatus();
+        if (!chainman.IsInitialBlockDownload() && chainman.m_shrink_cache_on_ibd_exit) {
+            chainman.ApplySyncedCacheProfile();
+        }
+    });
 
     // Main program logic starts here
     std::cout
@@ -272,7 +287,8 @@ epilogue:
         LOCK(cs_main);
         for (Chainstate* chainstate : chainman.GetAll()) {
             if (chainstate->CanFlushToDisk()) {
-                chainstate->ForceFlushStateToDisk();
+                BlockValidationState state;
+                chainstate->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
                 chainstate->ResetCoinsViews();
             }
         }

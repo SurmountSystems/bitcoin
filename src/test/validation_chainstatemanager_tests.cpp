@@ -5,6 +5,7 @@
 #include <chainparams.h>
 #include <consensus/validation.h>
 #include <kernel/disconnected_transactions.h>
+#include <kernel/caches.h>
 #include <node/chainstatemanager_args.h>
 #include <node/kernel_notifications.h>
 #include <node/utxo_snapshot.h>
@@ -106,6 +107,28 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager, TestChain100Setup)
 
     // Let scheduler events finish running to avoid accessing memory that is going to be unloaded
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
+}
+
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_apply_synced_cache_profile, TestChain100Setup)
+{
+    ChainstateManager& manager = *m_node.chainman;
+    LOCK(::cs_main);
+    manager.m_cached_finished_ibd.store(true, std::memory_order_relaxed);
+
+    const size_t ibd_coinstip{1024_MiB};
+    const size_t ibd_coinsdb{256_MiB};
+    manager.m_shrink_cache_on_ibd_exit = true;
+    manager.m_synced_cache_profile_applied = false;
+    manager.m_synced_cache_sizes = kernel::CacheSizes{512_MiB};
+    manager.m_total_coinstip_cache = ibd_coinstip;
+    manager.m_total_coinsdb_cache = ibd_coinsdb;
+
+    manager.ApplySyncedCacheProfile();
+
+    BOOST_CHECK_EQUAL(manager.m_total_coinstip_cache, manager.m_synced_cache_sizes.coins);
+    BOOST_CHECK_EQUAL(manager.m_total_coinsdb_cache, manager.m_synced_cache_sizes.coins_db);
+    BOOST_CHECK(manager.m_synced_cache_profile_applied);
+    BOOST_CHECK_EQUAL(manager.ActiveChainstate().m_coinstip_cache_size_bytes, manager.m_synced_cache_sizes.coins);
 }
 
 //! Test rebalancing the caches associated with each chainstate.
@@ -413,7 +436,8 @@ struct SnapshotTestSetup : TestChain100Setup {
         {
             for (Chainstate* cs : chainman.GetAll()) {
                 LOCK(::cs_main);
-                cs->ForceFlushStateToDisk();
+                BlockValidationState state;
+                cs->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
             }
             // Process all callbacks referring to the old manager before wiping it.
             m_node.validation_signals->SyncWithValidationInterfaceQueue();

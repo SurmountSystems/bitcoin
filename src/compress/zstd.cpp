@@ -28,7 +28,7 @@ struct ZstdDeleter {
 
 } // namespace
 
-struct BlockZstd::Impl
+struct DictZstd::Impl
 {
     std::vector<uint8_t> dictionary;
     std::unique_ptr<ZSTD_CDict, ZstdDeleter> cdict;
@@ -94,7 +94,22 @@ fs::path DefaultBlockDictionaryPath()
 #endif
 }
 
-BlockZstd::BlockZstd(std::vector<uint8_t> dictionary)
+fs::path DefaultUtxoDictionaryPath()
+{
+#ifdef UTXO_ZSTD_DICT_INSTALL_PATH
+    const fs::path install_path{fs::u8path(UTXO_ZSTD_DICT_INSTALL_PATH)};
+    if (fs::exists(install_path)) {
+        return install_path;
+    }
+#endif
+#ifdef UTXO_ZSTD_DICT_SOURCE_PATH
+    return fs::u8path(UTXO_ZSTD_DICT_SOURCE_PATH);
+#else
+    return {};
+#endif
+}
+
+DictZstd::DictZstd(std::vector<uint8_t> dictionary)
 {
     if (dictionary.empty()) return;
     try {
@@ -104,15 +119,15 @@ BlockZstd::BlockZstd(std::vector<uint8_t> dictionary)
     }
 }
 
-BlockZstd::BlockZstd() = default;
+DictZstd::DictZstd() = default;
 
-BlockZstd::BlockZstd(BlockZstd&&) noexcept = default;
+DictZstd::DictZstd(DictZstd&&) noexcept = default;
 
-BlockZstd& BlockZstd::operator=(BlockZstd&&) noexcept = default;
+DictZstd& DictZstd::operator=(DictZstd&&) noexcept = default;
 
-BlockZstd::~BlockZstd() = default;
+DictZstd::~DictZstd() = default;
 
-bool BlockZstd::Compress(std::span<const uint8_t> input, std::vector<uint8_t>& output, int level) const
+bool DictZstd::Compress(std::span<const uint8_t> input, std::vector<uint8_t>& output, int level) const
 {
     if (!m_impl) return false;
     level = std::clamp(level, MIN_LEVEL, MAX_LEVEL);
@@ -136,7 +151,7 @@ bool BlockZstd::Compress(std::span<const uint8_t> input, std::vector<uint8_t>& o
     return true;
 }
 
-bool BlockZstd::Decompress(std::span<const uint8_t> input, std::vector<uint8_t>& output, size_t max_output_size) const
+bool DictZstd::Decompress(std::span<const uint8_t> input, std::vector<uint8_t>& output, size_t max_output_size) const
 {
     if (!m_impl) return false;
 

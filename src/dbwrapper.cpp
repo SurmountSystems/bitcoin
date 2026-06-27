@@ -165,6 +165,7 @@ MDB_txn* BeginReadTxn(const LMDBContext& ctx)
         return g_tls_cache.txn;
     }
     ReleaseTLSReadTxn();
+    HandleLMDBError(mdb_reader_check(ctx.env, nullptr), "read reader check");
     MDB_txn* txn{nullptr};
     const int rc = mdb_txn_begin(ctx.env, nullptr, MDB_RDONLY, &txn);
     HandleLMDBError(rc, "read transaction begin");
@@ -485,7 +486,9 @@ const std::string CDBWrapper::OBFUSCATE_KEY_KEY("\000obfuscate_key", 14);
 
 std::vector<unsigned char> CDBWrapper::CreateObfuscateKey() const
 {
-    return FastRandomContext{}.randbytes(Obfuscation::KEY_SIZE);
+    return std::vector<unsigned char>{
+        reinterpret_cast<const unsigned char*>(Obfuscation::DEFAULT_KEY_BYTES.data()),
+        reinterpret_cast<const unsigned char*>(Obfuscation::DEFAULT_KEY_BYTES.data()) + Obfuscation::KEY_SIZE};
 }
 
 std::optional<std::string> CDBWrapper::ReadImpl(Span<const std::byte> key) const
@@ -511,6 +514,7 @@ size_t CDBWrapper::EstimateSizeImpl(Span<const std::byte> key1, Span<const std::
 {
     const auto& ctx = DBContext();
     ReleaseTLSReadTxn();
+    HandleLMDBError(mdb_reader_check(ctx.env, nullptr), "estimate reader check");
     MDB_txn* txn{nullptr};
     HandleLMDBError(mdb_txn_begin(ctx.env, nullptr, MDB_RDONLY, &txn), "estimate txn begin");
     MDB_cursor* cursor{nullptr};
@@ -552,6 +556,7 @@ struct CDBIterator::IteratorImpl {
     IteratorImpl(MDB_env* env, MDB_dbi dbi)
     {
         ReleaseTLSReadTxn();
+        HandleLMDBError(mdb_reader_check(env, nullptr), "iterator reader check");
         HandleLMDBError(mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn), "iterator txn begin");
         HandleLMDBError(mdb_cursor_open(txn, dbi, &cursor), "iterator cursor open");
     }

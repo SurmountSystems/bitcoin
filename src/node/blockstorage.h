@@ -51,6 +51,10 @@ namespace util {
 class SignalInterrupt;
 } // namespace util
 
+namespace node {
+struct BlockIndexWriteBatch;
+} // namespace node
+
 namespace kernel {
 /** Access to the block database (blocks/index/) */
 class BlockTreeDB : public CDBWrapper
@@ -58,6 +62,7 @@ class BlockTreeDB : public CDBWrapper
 public:
     using CDBWrapper::CDBWrapper;
     bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo, const std::unordered_map<std::string, node::PruneLockInfo>& prune_locks);
+    bool WriteBatchSync(const node::BlockIndexWriteBatch& batch);
     bool ReadBlockFileInfo(int nFile, CBlockFileInfo& info);
     bool ReadLastBlockFile(int& nFile);
     bool WriteReindexing(bool fReindexing);
@@ -112,6 +117,40 @@ struct PruneLockInfo {
         READWRITE(VARINT(obj.height_first));
         READWRITE(VARINT(obj.height_last));
     }
+};
+
+/** Snapshot of block index fields needed to read a block from disk without holding cs_main. */
+struct BlockReadLoc {
+    FlatFilePos pos;
+    uint256 hash;
+    bool have_data{false};
+
+    bool IsValid() const
+    {
+        return have_data && pos.nPos >= BLOCK_LEGACY_SERIALIZATION_HEADER_SIZE;
+    }
+};
+
+/** Snapshot of block index fields needed to read undo data from disk without holding cs_main. */
+struct UndoReadLoc {
+    FlatFilePos pos;
+    uint256 prev_block_hash;
+    bool have_undo{false};
+
+    bool IsValid() const
+    {
+        return have_undo && !pos.IsNull();
+    }
+};
+
+/** Immutable block index write batch collected under cs_main for LMDB write outside the lock. */
+struct BlockIndexWriteBatch {
+    std::vector<std::pair<int, CBlockFileInfo>> file_info;
+    int last_file{0};
+    std::vector<std::pair<uint256, CDiskBlockIndex>> block_indices;
+    std::unordered_map<std::string, PruneLockInfo> prune_locks;
+
+    bool empty() const { return file_info.empty() && block_indices.empty(); }
 };
 
 enum BlockfileType {
@@ -276,6 +315,7 @@ private:
     BlockfileType BlockfileTypeForHeight(int height);
 
     const kernel::BlockManagerOpts m_opts;
+    size_t m_block_tree_cache_bytes;
 
     const FlatFileSeq m_block_file_seq;
     const FlatFileSeq m_undo_file_seq;
@@ -320,9 +360,19 @@ public:
      */
     std::multimap<CBlockIndex*, CBlockIndex*> m_blocks_unlinked;
 
+    //! Serializes block-index collect→LMDB-write across chainstates (shared m_block_tree_db).
+    Mutex m_cs_block_index_write;
+
+    // LMDB writes also require m_cs_block_index_write (see WriteBlockIndexBatch).
     std::unique_ptr<BlockTreeDB> m_block_tree_db GUARDED_BY(::cs_main);
 
-    bool WriteBlockIndexDB() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool WriteBlockIndexDB();
+    //! Copy dirty block index state without clearing dirty flags (caller must hold cs_main).
+    BlockIndexWriteBatch PrepareBlockIndexWriteBatch() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Clear dirty flags for a batch whose LMDB write succeeded (caller must hold cs_main).
+    void CommitBlockIndexWriteBatch(const BlockIndexWriteBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Write a prepared batch to LMDB (requires m_cs_block_index_write; no cs_main).
+    bool WriteBlockIndexBatch(const BlockIndexWriteBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(m_cs_block_index_write);
     bool LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
@@ -449,12 +499,28 @@ public:
     bool ReadBlock(CBlock& block, const CBlockIndex& index, bool lowprio = false) const;
     bool ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& pos, bool lowprio = false) const;
 
+    //! Copy block read metadata (caller must hold cs_main).
+    BlockReadLoc CopyBlockReadLocAssumingLockHeld(const CBlockIndex& index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Copy block read metadata under a brief cs_main lock.
+    BlockReadLoc CopyBlockReadLoc(const CBlockIndex& index) const;
+    //! Copy undo read metadata (caller must hold cs_main).
+    UndoReadLoc CopyUndoReadLocAssumingLockHeld(const CBlockIndex& index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Copy undo read metadata under a brief cs_main lock.
+    UndoReadLoc CopyUndoReadLoc(const CBlockIndex& index) const;
+
     /** Decompress a zstd-compressed block payload. Returns false if unavailable or invalid. */
     bool DecompressBlockPayload(std::span<const uint8_t> compressed, std::vector<uint8_t>& payload) const;
 
     bool ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const;
+    bool ReadBlockUndo(CBlockUndo& blockundo, const UndoReadLoc& loc) const;
 
     void CleanupBlockRevFiles() const;
+
+    //! Current block index LMDB reader pool budget (bytes).
+    size_t GetBlockTreeCacheSize() const { return m_block_tree_cache_bytes; }
+
+    //! Reopen the block index LMDB environment with a new reader pool budget.
+    void ResizeBlockTreeCache(size_t new_cache_size) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };
 
 // Calls ActivateBestChain() even if no blocks are imported.

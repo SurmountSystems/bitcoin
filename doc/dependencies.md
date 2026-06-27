@@ -1,8 +1,10 @@
 # Dependencies
 
-These are the dependencies used by Bitcoin Core.
+These are the dependencies used by Bitcoin Core and Bitcoin Swords.
 You can find installation instructions in the `build-*.md` file for your platform.
 "Runtime" and "Version Used" are both in reference to the release binaries.
+
+**Bitcoin Swords note:** LMDB replaces LevelDB as the runtime database backend. Vendored LevelDB in `src/leveldb/` is retained only for the one-time LevelDB → LMDB migration library (`leveldb_migration`); it is not linked into normal node operation. See [design/swords.md](design/swords.md).
 
 ## Compiler
 
@@ -21,6 +23,7 @@ Bitcoin Core requires one of the following compilers.
 | [Boost](../depends/packages/boost.mk) | [link](https://www.boost.org/users/download/) | [1.81.0](https://github.com/bitcoin/bitcoin/pull/26557) | [1.73.0](https://github.com/bitcoin/bitcoin/pull/29066) | No |
 | [libevent](../depends/packages/libevent.mk) | [link](https://github.com/libevent/libevent/releases) | [2.1.12-stable](https://github.com/bitcoin/bitcoin/pull/21991) | [2.1.8](https://github.com/bitcoin/bitcoin/pull/24681) | No |
 | [LMDB](https://www.symas.com/lmdb) (embedded in `src/lmdb/` or system via `-DWITH_SYSTEM_LMDB=ON`) | [link](https://www.symas.com/lmdb) | 0.9.35 | 0.9.31 | Yes |
+| [zstd](https://github.com/facebook/zstd) (block and UTXO dictionary compression) | [link](https://github.com/facebook/zstd/releases) | system package | typical distro package (≥ 1.4) | Yes |
 | glibc | [link](https://www.gnu.org/software/libc/) | N/A | [2.31](https://github.com/bitcoin/bitcoin/pull/29987) | Yes |
 | Linux Kernel (if building that platform) | [link](https://www.kernel.org/) | N/A | [3.17.0](https://github.com/bitcoin/bitcoin/pull/27699) | Yes |
 

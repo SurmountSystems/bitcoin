@@ -27,6 +27,7 @@ add_executable(test_bitcoin
   bswap_tests.cpp
   caches_tests.cpp
   chainstate_write_tests.cpp
+  cs_main_locking_tests.cpp
   checkqueue_tests.cpp
   cluster_linearize_tests.cpp
   codex32_tests.cpp
@@ -121,6 +122,7 @@ add_executable(test_bitcoin
   util_trace_tests.cpp
   validation_block_tests.cpp
   validation_chainstate_tests.cpp
+  utxo_zstd_tests.cpp
   zstd_tests.cpp
   validation_chainstatemanager_tests.cpp
   validation_flush_tests.cpp

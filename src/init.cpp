@@ -54,6 +54,7 @@
 #include <node/blockstorage.h>
 #include <node/caches.h>
 #include <node/dbcache.h>
+#include <txdb.h>
 #include <node/chainstate.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
@@ -135,6 +136,8 @@ using common::ResolveErrMsg;
 using node::ApplyArgsManOptions;
 using node::BlockManager;
 using node::CalculateCacheSizes;
+using node::DbCacheProfile;
+using node::ShouldShrinkCacheOnIbdExit;
 using node::ChainstateLoadResult;
 using node::ChainstateLoadStatus;
 using node::DEFAULT_PERSIST_MEMPOOL;
@@ -367,7 +370,8 @@ void Shutdown(NodeContext& node)
         LOCK(cs_main);
         for (Chainstate* chainstate : node.chainman->GetAll()) {
             if (chainstate->CanFlushToDisk()) {
-                chainstate->ForceFlushStateToDisk();
+                BlockValidationState state;
+                chainstate->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
             }
         }
     }
@@ -393,7 +397,8 @@ void Shutdown(NodeContext& node)
         LOCK(cs_main);
         for (Chainstate* chainstate : node.chainman->GetAll()) {
             if (chainstate->CanFlushToDisk()) {
-                chainstate->ForceFlushStateToDisk();
+                BlockValidationState state;
+                chainstate->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
                 chainstate->ResetCoinsViews();
             }
         }
@@ -498,7 +503,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blocksxor",
                    strprintf("Whether an XOR-key applies to blocksdir *.dat files. "
                              "The created XOR-key will be zeros for an existing blocksdir or when `-blocksxor=0` is "
-                             "set, and random for a freshly initialized blocksdir. "
+                             "set, and the Swords default key (0x77 repeated per byte) for a freshly initialized blocksdir. "
                              "(default: %u)",
                              kernel::DEFAULT_XOR_BLOCKSDIR),
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -534,6 +539,12 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbbatchsize", strprintf("Maximum database write batch size in bytes (default: %u)", nDefaultDbBatchSize), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbcache=<n>", strprintf("Maximum database cache size <n> MiB (minimum %s, default is platform dependent, between %s and %s). Make sure you have enough RAM. In addition, unused memory allocated to the mempool is shared with this cache (see -maxmempool).", MIN_DBCACHE_BYTES / 1_MiB, MIN_DEFAULT_DBCACHE / 1_MiB, MAX_DEFAULT_DBCACHE / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-dbcache-ibd=<n>", strprintf("Database cache size <n> MiB while initial block download is active (0 = auto, default: ~62.5%% of usable RAM, capped at %s MiB).", MAX_DEFAULT_DBCACHE / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-dbcache-synced=<n>", strprintf("Database cache size <n> MiB after initial block download completes (0 = auto, default: ~25%% of usable RAM, capped at %s MiB).", MAX_DEFAULT_DBCACHE / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-coinscache=<n>", "Override in-memory UTXO tip cache size in MiB (0 = computed default from -dbcache split)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-coinsdbcache=<n>", "Override chainstate database cache / LMDB reader pool budget in MiB (0 = computed default from -dbcache split)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blocktreecache=<n>", "Override block index database cache in MiB (0 = computed default from -dbcache split)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-reservedram=<n>", strprintf("Reserve <n> MiB of system RAM for non-dbcache usage when computing automatic cache sizes (default: %s).", DEFAULT_RESERVED_RAM / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbfilesize",
                    strprintf("Target size of files within databases, in MiB (%u to %u, default: %u).",
                              1, 1024,
@@ -544,6 +555,16 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-migrateleveldb",
                    strprintf("Automatically migrate legacy LevelDB directories to LMDB on startup (default: %u)", true),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-utxozstd",
+                   strprintf("Enable zstd dictionary compression for UTXO values in chainstate (default: %u)", DEFAULT_UTXO_ZSTD),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-utxozstdlevel=<n>",
+                   strprintf("zstd compression level for UTXO storage (1-%d, default: %d)",
+                             compress::UtxoZstd::MAX_LEVEL, DEFAULT_UTXO_ZSTD_LEVEL),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-utxozstddict=<path>",
+                   "Path to zstd dictionary for UTXO compression (default: bundled share/swords/utxo.dict)",
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-allowignoredconf", strprintf("For backwards compatibility, treat an unused %s file in the datadir as a warning, not an error.", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1514,6 +1535,9 @@ static ChainstateLoadResult InitAndLoadChainstate(
         .signals = node.validation_signals.get(),
     };
     Assert(ApplyArgsManOptions(args, chainman_opts)); // no error can happen, already checked in AppInitParameterInteraction
+    const auto synced_cache_sizes = CalculateCacheSizes(args, g_enabled_filter_types.size(), DbCacheProfile::SYNCED);
+    chainman_opts.synced_cache_sizes = synced_cache_sizes.kernel;
+    chainman_opts.shrink_cache_on_ibd_exit = ShouldShrinkCacheOnIbdExit(args);
 
     BlockManager::Options blockman_opts{
         .chainparams = chainman_opts.chainparams,
@@ -1523,6 +1547,7 @@ static ChainstateLoadResult InitAndLoadChainstate(
             .path = args.GetDataDirNet() / "blocks" / "index",
             .cache_bytes = cache_sizes.block_tree_db,
             .wipe_data = do_reindex,
+            .obfuscate = true,
         },
     };
     Assert(ApplyArgsManOptions(args, blockman_opts)); // no error can happen, already checked in AppInitParameterInteraction
@@ -2090,7 +2115,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     g_zmq_notification_interface = CZMQNotificationInterface::Create(
         [&chainman = node.chainman](std::vector<uint8_t>& block, const CBlockIndex& index) {
             assert(chainman);
-            return chainman->m_blockman.ReadRawBlock(block, WITH_LOCK(cs_main, return index.GetBlockPos()));
+            const node::BlockReadLoc loc{chainman->m_blockman.CopyBlockReadLoc(index)};
+            return loc.IsValid() && chainman->m_blockman.ReadRawBlock(block, loc.pos);
         });
 
     if (g_zmq_notification_interface) {
@@ -2104,7 +2130,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (args.GetIntArg("-dbcache")) {
         node::LogOversizedDbCache(args);
     } else {
-        node::LogAutoDbCacheSettings();
+        node::LogAutoDbCacheSettings(args);
+        node::LogSyncedCacheTarget(args);
     }
     const auto [index_cache_sizes, kernel_cache_sizes] = CalculateCacheSizes(args, g_enabled_filter_types.size());
 

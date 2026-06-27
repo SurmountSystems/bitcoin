@@ -6,6 +6,7 @@
 #include <dbwrapper_leveldb_migrate.h>
 #include <serialize.h>
 #include <streams.h>
+#include <util/obfuscation.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
@@ -23,6 +24,16 @@
 using util::ToString;
 
 BOOST_FIXTURE_TEST_SUITE(dbwrapper_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(default_obfuscation_key)
+{
+    BOOST_CHECK(Obfuscation::DefaultKey());
+    BOOST_CHECK_EQUAL(HexStr(Obfuscation::DEFAULT_KEY_BYTES), "7777777777777777");
+    fs::path ph = m_args.GetDataDirBase() / "dbwrapper_default_obfuscation_key";
+    CDBWrapper dbw{{.path = ph, .cache_bytes = 1 << 20, .memory_only = true, .wipe_data = true, .obfuscate = true}};
+    BOOST_CHECK(dbwrapper_private::GetObfuscateKey(dbw));
+    BOOST_CHECK_EQUAL(dbwrapper_private::GetObfuscateKey(dbw).HexKey(), "7777777777777777");
+}
 
 BOOST_AUTO_TEST_CASE(dbwrapper)
 {

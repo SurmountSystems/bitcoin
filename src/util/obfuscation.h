@@ -22,6 +22,16 @@ public:
     using KeyType = uint64_t;
     static constexpr size_t KEY_SIZE{sizeof(KeyType)};
 
+    //! Default XOR key for new databases and blocksdirs: each byte 0x77
+    //! (hex `7777777777777777` for the 8-byte Obfuscation key).
+    static constexpr std::array<std::byte, KEY_SIZE> DEFAULT_KEY_BYTES = []() constexpr {
+        std::array<std::byte, KEY_SIZE> bytes{};
+        bytes.fill(std::byte{0x77});
+        return bytes;
+    }();
+
+    static Obfuscation DefaultKey() { return Obfuscation{DEFAULT_KEY_BYTES}; }
+
     Obfuscation() { SetRotations(0); }
     explicit Obfuscation(std::span<const std::byte, KEY_SIZE> key_bytes)
     {

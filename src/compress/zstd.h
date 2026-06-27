@@ -21,21 +21,21 @@ namespace compress {
 std::optional<std::vector<uint8_t>> LoadDictionaryFile(const fs::path& path);
 
 /**
- * zstd dictionary-backed compressor/decompressor for block payloads.
+ * zstd dictionary-backed compressor/decompressor.
  * Thread-safe for concurrent compress/decompress calls after construction.
  */
-class BlockZstd
+class DictZstd
 {
 public:
     static constexpr int MIN_LEVEL{1};
     static constexpr int MAX_LEVEL{22};
 
-    BlockZstd();
-    explicit BlockZstd(std::vector<uint8_t> dictionary);
-    BlockZstd(BlockZstd&&) noexcept;
-    BlockZstd& operator=(BlockZstd&&) noexcept;
-    BlockZstd(const BlockZstd&) = delete;
-    BlockZstd& operator=(const BlockZstd&) = delete;
+    DictZstd();
+    explicit DictZstd(std::vector<uint8_t> dictionary);
+    DictZstd(DictZstd&&) noexcept;
+    DictZstd& operator=(DictZstd&&) noexcept;
+    DictZstd(const DictZstd&) = delete;
+    DictZstd& operator=(const DictZstd&) = delete;
 
     /** True when a dictionary was loaded successfully. */
     explicit operator bool() const { return static_cast<bool>(m_impl); }
@@ -52,15 +52,21 @@ public:
      */
     bool Decompress(std::span<const uint8_t> input, std::vector<uint8_t>& output, size_t max_output_size) const;
 
-    ~BlockZstd();
+    ~DictZstd();
 
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
 
+using BlockZstd = DictZstd;
+using UtxoZstd = DictZstd;
+
 /** Resolve the default bundled block dictionary path for this build/install. */
 fs::path DefaultBlockDictionaryPath();
+
+/** Resolve the default bundled UTXO dictionary path for this build/install. */
+fs::path DefaultUtxoDictionaryPath();
 
 } // namespace compress
 

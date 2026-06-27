@@ -1,4 +1,6 @@
-# Bitcoin Core file system
+# Bitcoin Knots / Bitcoin Swords file system
+
+This document describes the on-disk layout for Bitcoin Knots / Bitcoin Swords data directories. Bitcoin Swords extends several formats (LMDB databases, per-block zstd compression, UTXO zstd at rest); see [design/swords.md](design/swords.md) for rationale and options.
 
 **Contents**
 
@@ -48,11 +50,10 @@ Subdirectory       | File(s)               | Description
 -------------------|-----------------------|------------
 `blocks/`          |                       | Blocks directory; can be specified by `-blocksdir` option (except for `blocks/index/`)
 `blocks/index/`    | LMDB database (`data.mdb`, `lock.mdb`) | Block index; `-blocksdir` option does not affect this path
-`blocks/`          | `blkNNNNN.dat`<sup>[\[2\]](#note2)</sup> | Actual Bitcoin blocks (network format, optionally zstd-compressed per block; 128 MiB per file)
-`share/swords/`    | `blk.dict`            | Default zstd dictionary for `blk*.dat` block compression (override with `-blockzstddict`)
+`blocks/`          | `blkNNNNN.dat`<sup>[\[2\]](#note2)</sup> | Actual Bitcoin blocks. Legacy layout: 8-byte header (magic + size) + raw serialized block. Swords extended layout: 9-byte header (magic + flags + stored_size) + payload; bit 0 of flags indicates zstd-compressed payload. Compression is per-block (not per-file) for random access. Plaintext is compressed then XOR-obfuscated via `xor.dat`. Max 128 MiB per file. Set `-blockzstd=0` to write new blocks with the legacy 8-byte header.
 `blocks/`          | `revNNNNN.dat`<sup>[\[2\]](#note2)</sup> | Block undo data (custom format)
 `blocks/`          | `xor.dat`             | Rolling XOR pattern for block and undo data files
-`chainstate/`      | LMDB database (`data.mdb`, `lock.mdb`) | Blockchain state (a compact representation of all currently unspent transaction outputs (UTXOs) and metadata about the transactions they are from)
+`chainstate/`      | LMDB database (`data.mdb`, `lock.mdb`) | Blockchain state (UTXO set and metadata). New UTXO writes use legacy raw serialized `Coin` bytes or `0x01 0x01` + zstd payload when compression wins; legacy and migrated entries remain readable. One `MDB_env` per database directory.
 `*.leveldb.bak/`   | Legacy LevelDB backup directory | Created when a pre-Swords LevelDB database is migrated to LMDB (e.g. `chainstate.leveldb.bak/`, `blocks/index.leveldb.bak/`, `indexes/txindex.leveldb.bak/`). Remove manually after verifying the migration. To roll back, delete the LMDB directory and rename the backup back to the original path.
 `*.lmdb-migrate-tmp/` | Temporary LMDB migration workspace | Present only during an in-progress migration; removed on success or failure
 `indexes/txindex/` | LMDB database (`data.mdb`, `lock.mdb`) | Transaction index; *optional*, used if `-txindex=1`
@@ -133,3 +134,26 @@ Path           | Description | Repository notes
 <a name="note1">1</a>. The `/` (slash, U+002F) is used as the platform-independent path component separator in this document.
 
 <a name="note2">2</a>. `NNNNN` matches `[0-9]{5}` regex.
+
+### Bitcoin Swords on-disk formats
+
+**Block file per-block header** (`src/node/blockfile_format.h`):
+
+| Format | Header size | Layout |
+|--------|-------------|--------|
+| Legacy | 8 bytes | `magic (4)` + `payload_size (4)` + `payload` |
+| Extended | 9 bytes | `magic (4)` + `flags (1)` + `stored_size (4)` + `payload` |
+
+When `flags & 0x01`, the payload is zstd-compressed using the bundled block dictionary (default path under the install prefix; override with `-blockzstddict`). `FlatFilePos.nPos` always points to the first payload byte. When `-blockzstd=0`, new blocks use the legacy 8-byte header instead of the extended format.
+
+**UTXO value encoding** (`src/txdb.cpp`):
+
+| Form | Prefix | Read | Write |
+|------|--------|------|-------|
+| Legacy (pre-Swords / migrated) | none | ✓ | ✓ (when compression disabled or not smaller) |
+| Versioned uncompressed | `0x01 0x00` | ✓ | — (not written by current code) |
+| Compressed LMDB | `0x01 0x01` | ✓ | ✓ (when `-utxozstd=1` and compressed size wins) |
+
+**Bundled zstd dictionaries** (not in the datadir): shipped under the binary install prefix at `share/swords/blk.dict` and `share/swords/utxo.dict` (or the source tree during development). Override with `-blockzstddict` / `-utxozstddict`. See [design/swords.md](design/swords.md).
+
+**LMDB layout:** Each database directory (`chainstate/`, `blocks/index/`, `indexes/...`) contains `data.mdb` and `lock.mdb`. Map size is derived from `-dbcache` or set explicitly with `-dbmapsize`. Legacy LevelDB directories are migrated automatically on startup (`-migrateleveldb=1`, default) with backup to `*.leveldb.bak/`.

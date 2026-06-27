@@ -1,0 +1,155 @@
+// Copyright (c) 2025 The Bitcoin Swords developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <node/blockstorage.h>
+#include <sync.h>
+#include <validation.h>
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+
+#include <boost/test/unit_test.hpp>
+#include <test/util/setup_common.h>
+
+using node::BlockManager;
+
+BOOST_FIXTURE_TEST_SUITE(cs_main_locking_tests, TestChain100Setup)
+
+BOOST_AUTO_TEST_CASE(block_read_loc_snapshot)
+{
+    const CBlockIndex* tip;
+    node::BlockReadLoc loc;
+    {
+        LOCK(::cs_main);
+        tip = m_node.chainman->ActiveChain().Tip();
+        loc = m_node.chainman->m_blockman.CopyBlockReadLocAssumingLockHeld(*tip);
+    }
+
+    BOOST_REQUIRE(tip);
+    BOOST_CHECK(loc.IsValid());
+    BOOST_CHECK_EQUAL(loc.hash, tip->GetBlockHash());
+
+    CBlock block;
+    BOOST_CHECK(m_node.chainman->m_blockman.ReadBlock(block, loc.pos, loc.hash));
+    BOOST_CHECK_EQUAL(block.GetHash(), tip->GetBlockHash());
+}
+
+BOOST_AUTO_TEST_CASE(block_index_prepare_write_commit)
+{
+    BlockManager& blockman{m_node.chainman->m_blockman};
+    node::BlockIndexWriteBatch batch;
+    size_t num_indices{0};
+    {
+        LOCK(::cs_main);
+        batch = blockman.PrepareBlockIndexWriteBatch();
+        num_indices = batch.block_indices.size();
+        BOOST_REQUIRE(!batch.empty());
+    }
+
+    LOCK(blockman.m_cs_block_index_write);
+    BOOST_REQUIRE(blockman.WriteBlockIndexBatch(batch));
+    {
+        LOCK(::cs_main);
+        blockman.CommitBlockIndexWriteBatch(batch);
+    }
+
+    node::BlockIndexWriteBatch batch2;
+    {
+        LOCK(::cs_main);
+        batch2 = blockman.PrepareBlockIndexWriteBatch();
+    }
+    // Dirty flags were cleared only after successful write.
+    BOOST_CHECK(batch2.block_indices.size() < num_indices);
+}
+
+//! Regression: FlushStateToDisk and WriteBlockIndexDB must not deadlock when run
+//! concurrently (lock-order inversion between cs_main and m_cs_block_index_write).
+BOOST_AUTO_TEST_CASE(flush_state_and_write_block_index_no_deadlock)
+{
+    BlockManager& blockman{m_node.chainman->m_blockman};
+    Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+
+    constexpr auto TIMEOUT{std::chrono::seconds{10}};
+    const auto deadline{std::chrono::steady_clock::now() + TIMEOUT};
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> flush_failed{false};
+    std::atomic<bool> write_failed{false};
+    std::atomic<int> flush_iterations{0};
+    std::atomic<int> write_iterations{0};
+
+    auto flush_worker{[&] {
+        BlockValidationState state;
+        while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
+            if (!chainstate.FlushStateToDisk(state, FlushStateMode::ALWAYS)) {
+                flush_failed = true;
+                return;
+            }
+            ++flush_iterations;
+        }
+    }};
+
+    auto write_worker{[&] {
+        while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
+            if (!blockman.WriteBlockIndexDB()) {
+                write_failed = true;
+                return;
+            }
+            ++write_iterations;
+        }
+    }};
+
+    std::vector<std::thread> threads;
+    threads.reserve(4);
+    for (int i = 0; i < 2; ++i) {
+        threads.emplace_back(flush_worker);
+        threads.emplace_back(write_worker);
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+    stop = true;
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    BOOST_CHECK_MESSAGE(std::chrono::steady_clock::now() < deadline, "timed out waiting for flush/write workers");
+    BOOST_CHECK(!flush_failed);
+    BOOST_CHECK(!write_failed);
+    BOOST_CHECK(flush_iterations > 0);
+    BOOST_CHECK(write_iterations > 0);
+}
+
+BOOST_AUTO_TEST_CASE(block_index_write_mutex_serializes)
+{
+    BlockManager& blockman{m_node.chainman->m_blockman};
+    std::atomic<bool> holder_running{false};
+    std::atomic<bool> waiter_acquired{false};
+
+    std::thread holder{[&] {
+        LOCK(blockman.m_cs_block_index_write);
+        holder_running = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }};
+
+    while (!holder_running) {
+        std::this_thread::yield();
+    }
+
+    std::thread waiter{[&] {
+        LOCK(blockman.m_cs_block_index_write);
+        waiter_acquired = true;
+    }};
+
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    BOOST_CHECK(!waiter_acquired);
+
+    holder.join();
+    waiter.join();
+    BOOST_CHECK(waiter_acquired);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

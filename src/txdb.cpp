@@ -6,11 +6,13 @@
 #include <txdb.h>
 
 #include <coins.h>
+#include <compress/zstd.h>
 #include <dbwrapper.h>
 #include <logging.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <serialize.h>
+#include <streams.h>
 #include <uint256.h>
 #include <util/vector.h>
 
@@ -25,16 +27,93 @@ static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
 // Keys used in previous version that might still be found in the DB:
 static constexpr uint8_t DB_COINS{'c'};
 
-bool CCoinsViewDB::NeedsUpgrade()
+namespace {
+static constexpr uint8_t COIN_VALUE_VERSION{1};
+static constexpr uint8_t COIN_VALUE_UNCOMPRESSED{0};
+static constexpr uint8_t COIN_VALUE_COMPRESSED{1};
+//! Upper bound for a single decompressed UTXO entry (generous DoS limit).
+static constexpr size_t MAX_COIN_VALUE_SIZE{1 << 20};
+
+struct CoinDBValue {
+    std::vector<uint8_t> bytes;
+
+    template<typename Stream>
+    void Serialize(Stream& s) const
+    {
+        if (!bytes.empty()) s.write(MakeByteSpan(bytes));
+    }
+
+    template<typename Stream>
+    void Unserialize(Stream& s)
+    {
+        bytes.resize(s.size());
+        if (!bytes.empty()) s.read(MakeWritableByteSpan(bytes));
+    }
+};
+
+bool TryDeserializeCoin(std::span<const uint8_t> data, Coin& coin)
 {
-    std::unique_ptr<CDBIterator> cursor{m_db->NewIterator()};
-    // DB_COINS was deprecated in v0.15.0, commit
-    // 1088b02f0ccd7358d2b7076bb9e122d59d502d02
-    cursor->Seek(std::make_pair(DB_COINS, uint256{}));
-    return cursor->Valid();
+    if (data.empty()) return false;
+    try {
+        DataStream ss{data};
+        ss >> coin;
+    } catch (const std::exception&) {
+        return false;
+    }
+    return !coin.IsSpent();
 }
 
-namespace {
+bool DecodeCoinValue(std::span<const uint8_t> data, const compress::UtxoZstd& zstd, Coin& coin)
+{
+    if (TryDeserializeCoin(data, coin)) return true;
+
+    if (data.size() >= 2 && data[0] == COIN_VALUE_VERSION && data[1] == COIN_VALUE_UNCOMPRESSED) {
+        return TryDeserializeCoin(data.subspan(2), coin);
+    }
+
+    if (data.size() >= 2 && data[0] == COIN_VALUE_VERSION && data[1] == COIN_VALUE_COMPRESSED) {
+        if (!zstd) return false;
+        std::vector<uint8_t> decompressed;
+        if (!zstd.Decompress(data.subspan(2), decompressed, MAX_COIN_VALUE_SIZE)) return false;
+        return TryDeserializeCoin(decompressed, coin);
+    }
+
+    return false;
+}
+
+std::vector<uint8_t> SerializeCoin(const Coin& coin)
+{
+    std::vector<uint8_t> serialized;
+    VectorWriter{serialized, 0, coin};
+    return serialized;
+}
+
+std::vector<uint8_t> EncodeCoinValue(const Coin& coin, const CoinsViewOptions& options, const compress::UtxoZstd& zstd)
+{
+    const std::vector<uint8_t> serialized{SerializeCoin(coin)};
+    if (!options.utxo_zstd || !zstd) {
+        return serialized;
+    }
+
+    std::vector<uint8_t> compressed;
+    if (!zstd.Compress(serialized, compressed, options.utxo_zstd_level)) {
+        return serialized;
+    }
+
+    const size_t stored_size{2 + compressed.size()};
+    if (stored_size >= serialized.size()) {
+        LogDebug(BCLog::COINDB, "Skipping UTXO zstd compression: stored size %u >= legacy size %u\n",
+                 stored_size, serialized.size());
+        return serialized;
+    }
+
+    std::vector<uint8_t> stored;
+    stored.reserve(stored_size);
+    stored.push_back(COIN_VALUE_VERSION);
+    stored.push_back(COIN_VALUE_COMPRESSED);
+    stored.insert(stored.end(), compressed.begin(), compressed.end());
+    return stored;
+}
 
 struct CoinEntry {
     COutPoint* outpoint;
@@ -44,12 +123,45 @@ struct CoinEntry {
     SERIALIZE_METHODS(CoinEntry, obj) { READWRITE(obj.key, obj.outpoint->hash, VARINT(obj.outpoint->n)); }
 };
 
+compress::UtxoZstd LoadUtxoZstd(const CoinsViewOptions& options)
+{
+    fs::path dict_path;
+    if (options.utxo_zstd_dict_path) {
+        dict_path = *options.utxo_zstd_dict_path;
+    } else {
+        dict_path = compress::DefaultUtxoDictionaryPath();
+    }
+
+    if (dict_path.empty()) return {};
+
+    if (auto dictionary{compress::LoadDictionaryFile(dict_path)}) {
+        return compress::UtxoZstd{std::move(*dictionary)};
+    }
+    return {};
+}
+
 } // namespace
+
+bool CCoinsViewDB::NeedsUpgrade()
+{
+    std::unique_ptr<CDBIterator> cursor{m_db->NewIterator()};
+    // DB_COINS was deprecated in v0.15.0, commit
+    // 1088b02f0ccd7358d2b7076bb9e122d59d502d02
+    cursor->Seek(std::make_pair(DB_COINS, uint256{}));
+    return cursor->Valid();
+}
 
 CCoinsViewDB::CCoinsViewDB(DBParams db_params, CoinsViewOptions options) :
     m_db_params{std::move(db_params)},
     m_options{std::move(options)},
-    m_db{std::make_unique<CDBWrapper>(m_db_params)} { }
+    m_db{std::make_unique<CDBWrapper>(m_db_params)},
+    m_utxo_zstd{LoadUtxoZstd(m_options)}
+{
+    if (m_options.utxo_zstd && !m_utxo_zstd) {
+        LogWarning("UTXO zstd compression is enabled (-utxozstd=1) but no dictionary is loaded; "
+                   "new UTXO writes will be stored uncompressed.\n");
+    }
+}
 
 void CCoinsViewDB::ResizeCache(size_t new_cache_size)
 {
@@ -65,9 +177,23 @@ void CCoinsViewDB::ResizeCache(size_t new_cache_size)
     }
 }
 
+bool CCoinsViewDB::ReadCoinValue(const COutPoint& outpoint, Coin& coin) const
+{
+    CoinDBValue stored;
+    if (!m_db->Read(CoinEntry(&outpoint), stored)) return false;
+    return DecodeCoinValue(stored.bytes, m_utxo_zstd, coin);
+}
+
+void CCoinsViewDB::WriteCoinValue(CDBBatch& batch, const COutPoint& outpoint, const Coin& coin)
+{
+    CoinDBValue stored;
+    stored.bytes = EncodeCoinValue(coin, m_options, m_utxo_zstd);
+    batch.Write(CoinEntry(&outpoint), stored);
+}
+
 std::optional<Coin> CCoinsViewDB::GetCoin(const COutPoint& outpoint) const
 {
-    if (Coin coin; m_db->Read(CoinEntry(&outpoint), coin)) return coin;
+    if (Coin coin; ReadCoinValue(outpoint, coin)) return coin;
     return std::nullopt;
 }
 
@@ -122,7 +248,7 @@ bool CCoinsViewDB::BatchWrite(CoinsViewCacheCursor& cursor, const uint256 &hashB
             if (it->second.coin.IsSpent())
                 batch.Erase(entry);
             else
-                batch.Write(entry, it->second.coin);
+                WriteCoinValue(batch, it->first, it->second.coin);
             changed++;
         }
         count++;
@@ -162,8 +288,8 @@ class CCoinsViewDBCursor: public CCoinsViewCursor
 public:
     // Prefer using CCoinsViewDB::Cursor() since we want to perform some
     // cache warmup on instantiation.
-    CCoinsViewDBCursor(CDBIterator* pcursorIn, const uint256&hashBlockIn):
-        CCoinsViewCursor(hashBlockIn), pcursor(pcursorIn) {}
+    CCoinsViewDBCursor(CDBIterator* pcursorIn, const uint256&hashBlockIn, const compress::UtxoZstd& zstd_in):
+        CCoinsViewCursor(hashBlockIn), pcursor(pcursorIn), zstd(zstd_in) {}
     ~CCoinsViewDBCursor() = default;
 
     bool GetKey(COutPoint &key) const override;
@@ -175,6 +301,7 @@ public:
 private:
     std::unique_ptr<CDBIterator> pcursor;
     std::pair<char, COutPoint> keyTmp;
+    const compress::UtxoZstd& zstd;
 
     friend class CCoinsViewDB;
 };
@@ -182,7 +309,7 @@ private:
 std::unique_ptr<CCoinsViewCursor> CCoinsViewDB::Cursor() const
 {
     auto i = std::make_unique<CCoinsViewDBCursor>(
-        const_cast<CDBWrapper&>(*m_db).NewIterator(), GetBestBlock());
+        const_cast<CDBWrapper&>(*m_db).NewIterator(), GetBestBlock(), m_utxo_zstd);
     /* It seems that there are no "const iterators" for the database wrapper.  Since we
        only need read operations on it, use a const-cast to get around
        that restriction.  */
@@ -210,7 +337,9 @@ bool CCoinsViewDBCursor::GetKey(COutPoint &key) const
 
 bool CCoinsViewDBCursor::GetValue(Coin &coin) const
 {
-    return pcursor->GetValue(coin);
+    CoinDBValue stored;
+    if (!pcursor->GetValue(stored)) return false;
+    return DecodeCoinValue(stored.bytes, zstd, coin);
 }
 
 bool CCoinsViewDBCursor::Valid() const

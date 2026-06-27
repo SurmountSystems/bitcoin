@@ -102,6 +102,23 @@ bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
     return WriteBatch(batch, true);
 }
 
+bool BlockTreeDB::WriteBatchSync(const node::BlockIndexWriteBatch& index_batch)
+{
+    CDBBatch batch(*this);
+    for (const auto& [file, info] : index_batch.file_info) {
+        batch.Write(std::make_pair(DB_BLOCK_FILES, file), info);
+    }
+    batch.Write(DB_LAST_BLOCK, index_batch.last_file);
+    for (const auto& [hash, disk_index] : index_batch.block_indices) {
+        batch.Write(std::make_pair(DB_BLOCK_INDEX, hash), disk_index);
+    }
+    for (const auto& prune_lock : index_batch.prune_locks) {
+        if (prune_lock.second.temporary) continue;
+        batch.Write(std::make_pair(DB_PRUNE_LOCK, prune_lock.first), prune_lock.second);
+    }
+    return WriteBatch(batch, true);
+}
+
 bool BlockTreeDB::WritePruneLock(const std::string& name, const node::PruneLockInfo& lock_info) {
     if (lock_info.temporary) return true;
     return Write(std::make_pair(DB_PRUNE_LOCK, name), lock_info);
@@ -595,26 +612,127 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
     return true;
 }
 
-bool BlockManager::WriteBlockIndexDB()
+BlockIndexWriteBatch BlockManager::PrepareBlockIndexWriteBatch()
 {
     AssertLockHeld(::cs_main);
-    std::vector<std::pair<int, const CBlockFileInfo*>> vFiles;
-    vFiles.reserve(m_dirty_fileinfo.size());
-    for (std::set<int>::iterator it = m_dirty_fileinfo.begin(); it != m_dirty_fileinfo.end();) {
-        vFiles.emplace_back(*it, &m_blockfile_info[*it]);
-        m_dirty_fileinfo.erase(it++);
+    BlockIndexWriteBatch batch;
+    batch.file_info.reserve(m_dirty_fileinfo.size());
+    for (const int file : m_dirty_fileinfo) {
+        batch.file_info.emplace_back(file, m_blockfile_info[file]);
     }
-    std::vector<const CBlockIndex*> vBlocks;
-    vBlocks.reserve(m_dirty_blockindex.size());
-    for (std::set<CBlockIndex*>::iterator it = m_dirty_blockindex.begin(); it != m_dirty_blockindex.end();) {
-        vBlocks.push_back(*it);
-        m_dirty_blockindex.erase(it++);
+    batch.block_indices.reserve(m_dirty_blockindex.size());
+    for (const CBlockIndex* pindex : m_dirty_blockindex) {
+        batch.block_indices.emplace_back(pindex->GetBlockHash(), CDiskBlockIndex{pindex});
     }
-    int max_blockfile = WITH_LOCK(cs_LastBlockFile, return this->MaxBlockfileNum());
-    if (!m_block_tree_db->WriteBatchSync(vFiles, max_blockfile, vBlocks, m_prune_locks)) {
-        return false;
+    batch.last_file = WITH_LOCK(cs_LastBlockFile, return this->MaxBlockfileNum());
+    batch.prune_locks = m_prune_locks;
+    return batch;
+}
+
+namespace {
+bool DiskIndexMatches(const CBlockIndex& index, const CDiskBlockIndex& disk)
+{
+    return index.nHeight == disk.nHeight
+        && index.nStatus == disk.nStatus
+        && index.nTx == disk.nTx
+        && index.nFile == disk.nFile
+        && index.nDataPos == disk.nDataPos
+        && index.nUndoPos == disk.nUndoPos
+        && (index.pprev ? index.pprev->GetBlockHash() : uint256()) == disk.hashPrev;
+}
+
+bool BlockFileInfoMatches(const CBlockFileInfo& a, const CBlockFileInfo& b)
+{
+    return a.nBlocks == b.nBlocks
+        && a.nSize == b.nSize
+        && a.nUndoSize == b.nUndoSize
+        && a.nHeightFirst == b.nHeightFirst
+        && a.nHeightLast == b.nHeightLast
+        && a.nTimeFirst == b.nTimeFirst
+        && a.nTimeLast == b.nTimeLast;
+}
+} // namespace
+
+void BlockManager::CommitBlockIndexWriteBatch(const BlockIndexWriteBatch& batch)
+{
+    AssertLockHeld(::cs_main);
+    for (const auto& [file, disk_info] : batch.file_info) {
+        if (m_dirty_fileinfo.contains(file) && BlockFileInfoMatches(m_blockfile_info[file], disk_info)) {
+            m_dirty_fileinfo.erase(file);
+        }
     }
+    for (const auto& [hash, disk_index] : batch.block_indices) {
+        if (CBlockIndex* pindex{LookupBlockIndex(hash)}) {
+            if (m_dirty_blockindex.contains(pindex) && DiskIndexMatches(*pindex, disk_index)) {
+                m_dirty_blockindex.erase(pindex);
+            }
+        }
+    }
+}
+
+bool BlockManager::WriteBlockIndexBatch(const BlockIndexWriteBatch& batch)
+{
+    AssertLockHeld(m_cs_block_index_write);
+    if (batch.empty()) {
+        return true;
+    }
+    return m_block_tree_db->WriteBatchSync(batch);
+}
+
+bool BlockManager::WriteBlockIndexDB()
+{
+    BlockIndexWriteBatch batch;
+    {
+        LOCK(::cs_main);
+        batch = PrepareBlockIndexWriteBatch();
+    }
+    {
+        LOCK(m_cs_block_index_write);
+        if (!WriteBlockIndexBatch(batch)) {
+            return false;
+        }
+    }
+    LOCK(::cs_main);
+    CommitBlockIndexWriteBatch(batch);
     return true;
+}
+
+BlockReadLoc BlockManager::CopyBlockReadLocAssumingLockHeld(const CBlockIndex& index) const
+{
+    AssertLockHeld(::cs_main);
+    BlockReadLoc loc;
+    loc.hash = index.GetBlockHash();
+    if (index.nStatus & BLOCK_HAVE_DATA) {
+        loc.have_data = true;
+        loc.pos.nFile = index.nFile;
+        loc.pos.nPos = index.nDataPos;
+    }
+    return loc;
+}
+
+BlockReadLoc BlockManager::CopyBlockReadLoc(const CBlockIndex& index) const
+{
+    LOCK(::cs_main);
+    return CopyBlockReadLocAssumingLockHeld(index);
+}
+
+UndoReadLoc BlockManager::CopyUndoReadLocAssumingLockHeld(const CBlockIndex& index) const
+{
+    AssertLockHeld(::cs_main);
+    UndoReadLoc loc;
+    if ((index.nStatus & BLOCK_HAVE_UNDO) && index.pprev) {
+        loc.have_undo = true;
+        loc.pos.nFile = index.nFile;
+        loc.pos.nPos = index.nUndoPos;
+        loc.prev_block_hash = index.pprev->GetBlockHash();
+    }
+    return loc;
+}
+
+UndoReadLoc BlockManager::CopyUndoReadLoc(const CBlockIndex& index) const
+{
+    LOCK(::cs_main);
+    return CopyUndoReadLocAssumingLockHeld(index);
 }
 
 bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
@@ -794,12 +912,19 @@ CBlockFileInfo* BlockManager::GetBlockFileInfo(size_t n)
 
 bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const
 {
-    const FlatFilePos pos{WITH_LOCK(::cs_main, return index.GetUndoPos())};
+    return ReadBlockUndo(blockundo, CopyUndoReadLoc(index));
+}
+
+bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const UndoReadLoc& loc) const
+{
+    if (!loc.IsValid()) {
+        return false;
+    }
 
     // Open history file to read
-    AutoFile file{OpenUndoFile(pos, true)};
+    AutoFile file{OpenUndoFile(loc.pos, true)};
     if (file.IsNull()) {
-        LogError("OpenUndoFile failed for %s while reading block undo", pos.ToString());
+        LogError("OpenUndoFile failed for %s while reading block undo", loc.pos.ToString());
         return false;
     }
     BufferedReader filein{std::move(file)};
@@ -808,17 +933,17 @@ bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index
     // Read block
     uint256 hashChecksum;
     HashVerifier verifier{filein}; // Use HashVerifier as reserializing may lose data, c.f. commit d342424301013ec47dc146a4beb49d5c9319d80a
-        verifier << index.pprev->GetBlockHash();
+        verifier << loc.prev_block_hash;
         verifier >> blockundo;
         filein >> hashChecksum;
 
     // Verify checksum
     if (hashChecksum != verifier.GetHash()) {
-        LogError("%s: Checksum mismatch at %s\n", __func__, pos.ToString());
+        LogError("%s: Checksum mismatch at %s\n", __func__, loc.pos.ToString());
         return false;
     }
     } catch (const std::exception& e) {
-        LogError("Deserialize or I/O error - %s at %s while reading block undo", e.what(), pos.ToString());
+        LogError("Deserialize or I/O error - %s at %s while reading block undo", e.what(), loc.pos.ToString());
         return false;
     }
 
@@ -1208,8 +1333,11 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
 bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index, const bool lowprio) const
 {
-    const FlatFilePos block_pos{WITH_LOCK(cs_main, return index.GetBlockPos())};
-    return ReadBlock(block, block_pos, index.GetBlockHash(), /*lowprio=*/ lowprio);
+    const BlockReadLoc loc{CopyBlockReadLoc(index)};
+    if (!loc.IsValid()) {
+        return false;
+    }
+    return ReadBlock(block, loc.pos, loc.hash, /*lowprio=*/lowprio);
 }
 
 bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& pos, const bool lowprio) const
@@ -1352,9 +1480,7 @@ static auto InitBlocksdirXorKey(const BlockManager::Options& opts)
     }
 
     if (opts.use_xor && first_run) {
-        // Only use random fresh key when the boolean option is set and on the
-        // very first start of the program.
-        FastRandomContext{}.fillrand(xor_key);
+        xor_key = Obfuscation::DEFAULT_KEY_BYTES;
     }
 
     const fs::path xor_key_path{opts.blocks_dir / "xor.dat"};
@@ -1390,11 +1516,26 @@ static auto InitBlocksdirXorKey(const BlockManager::Options& opts)
     return Obfuscation{xor_key};
 }
 
+void BlockManager::ResizeBlockTreeCache(size_t new_cache_size)
+{
+    AssertLockHeld(::cs_main);
+    if (m_opts.block_tree_db_params.memory_only) return;
+    if (m_block_tree_cache_bytes == new_cache_size) return;
+
+    DBParams params{m_opts.block_tree_db_params};
+    params.cache_bytes = new_cache_size;
+    params.wipe_data = false;
+    m_block_tree_db = std::make_unique<BlockTreeDB>(params);
+    m_block_tree_cache_bytes = new_cache_size;
+    LogPrintf("Resized block tree cache to %.1f MiB\n", new_cache_size * (1.0 / 1024 / 1024));
+}
+
 BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
     : m_prune_mode{opts.prune_target > 0},
       m_xor_key{InitBlocksdirXorKey(opts)},
       m_block_zstd{InitBlockZstd(opts)},
       m_opts{std::move(opts)},
+      m_block_tree_cache_bytes{m_opts.block_tree_db_params.cache_bytes},
       m_block_file_seq{FlatFileSeq{m_opts.blocks_dir, "blk", m_opts.fast_prune ? 0x4000 /* 16kB */ : BLOCKFILE_CHUNK_SIZE}},
       m_undo_file_seq{FlatFileSeq{m_opts.blocks_dir, "rev", UNDOFILE_CHUNK_SIZE}},
       m_interrupt{interrupt}

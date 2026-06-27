@@ -1,3 +1,51 @@
+Bitcoin Swords
+==============
+
+**Bitcoin Swords** is a fork of [Bitcoin Knots](https://bitcoinknots.org) (`29.x-knots` branch) focused on performance and storage for high-RAM full nodes. It retains full Knots consensus, including [BIP-110](https://github.com/bitcoin/bips/blob/master/bip-0110.mediawiki) (Reduced Data Temporary Softfork / RDTS). **This is not a consensus fork** — all changes are local node implementation details (storage format, database backend, caching). Blocks relayed on the network and chainstate hashes remain identical to Knots.
+
+See the [design document](doc/design/swords.md) for architecture, reasoning, and implementation status.
+
+### Features
+
+| Feature | Status | Summary |
+|---------|--------|---------|
+| **blk*.dat zstd compression** | Implemented (code) | Per-block zstd dictionary compression; legacy 8-byte headers still readable; bundled dict is a placeholder |
+| **LevelDB → LMDB** | Implemented (code) | `CDBWrapper` uses LMDB with automatic migration from LevelDB; **not yet exercised on a real datadir** |
+| **Expanded caches + UTXO zstd** | Implemented (code) | Up to 48 GiB auto dbcache; IBD/synced profiles; UTXO zstd at LMDB boundary |
+| **cs_main locking** | Implemented (Phase B, partial verify) | Shorter critical sections; lock-order fix applied; parallel validation test still flaky |
+
+**Not production-ready.** Unit tests cover most Swords paths, but `validation_block_tests` is intermittently flaky, `validation_chainstatemanager_tests` (assumeutxo) currently fails against LMDB, functional tests and mainnet migration have not been run. See [doc/design/swords.md](doc/design/swords.md) verification gates.
+
+**Dedicated datadir:** `~/.bitcoin-swords` (hardlink clone from Core v30; `bitcoin.conf` present; first `bitcoind` start not yet attempted).
+
+### Example high-RAM configuration
+
+For a machine with 96 GiB RAM (adjust values to your hardware):
+
+```ini
+# Reserve RAM for OS, wallet, mempool, and other processes
+reservedram=4096
+
+# Aggressive cache during initial block download; shrinks automatically on IBD exit
+# when -dbcache is not set explicitly (auto defaults: ~62.5% / ~25% of usable RAM)
+dbcache-ibd=49152
+# Conservative override; auto synced ≈ 23 GiB with 96 GiB RAM and reservedram=4096
+dbcache-synced=16384
+
+# LevelDB → LMDB migration (enabled by default; shown for clarity)
+migrateleveldb=1
+
+# Block and UTXO zstd compression (enabled by default; shown for clarity)
+blockzstd=1
+blockzstdlevel=20
+utxozstd=1
+utxozstdlevel=20
+```
+
+All Swords-specific options are documented in [doc/bitcoin-conf.md](doc/bitcoin-conf.md#bitcoin-swords-options).
+
+---
+
 Bitcoin Knots
 =============
 
