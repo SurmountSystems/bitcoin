@@ -159,6 +159,32 @@ Each existing database directory (`chainstate/`, `blocks/index/`, `indexes/...`)
 | Embedded LMDB | `src/lmdb/` (0.9.35) |
 | Tests | `src/test/dbwrapper_tests.cpp` |
 
+#### Migration smoke procedure
+
+Use a dedicated datadir (e.g. `~/.bitcoin-swords`); never run migration smoke against production `~/.bitcoin`.
+
+```bash
+# Migrate only — no peers, no IBD during smoke
+bitcoind -datadir=$HOME/.bitcoin-swords -connect=0 -daemon=0
+
+# After "Done loading", verify RPC then stop before any catch-up:
+bitcoin-cli -datadir=$HOME/.bitcoin-swords getblockchaininfo
+bitcoin-cli -datadir=$HOME/.bitcoin-swords gettxoutsetinfo   # optional; slow on large UTXO sets
+bitcoin-cli -datadir=$HOME/.bitcoin-swords stop
+```
+
+Confirm in `debug.log`: three `Finished LevelDB -> LMDB migration` lines, `Opened LMDB successfully` for each DB, no `MDB_MAP_FULL`. On second start, expect direct `Opening LMDB` / `Opened LMDB successfully` with **no** new `Migrating LevelDB` lines.
+
+**Do not** leave the node on the open network during migration smoke. The P0-3 run synced ~600 blocks between migration completion and `stop`; shutdown then raced with `UpdateTip`, leaving chainstate tip ahead of flushed UTXOs (recoverable with `-reindex-chainstate`, not a migration defect).
+
+#### Known operational caveats
+
+| Caveat | Notes |
+|--------|-------|
+| **Shutdown during IBD** | `MDB_NOSYNC` matches prior LevelDB durability: shutdown flush is the durability boundary. If `stop` is requested while msghand is still connecting blocks, `UpdateTip` may run after `Shutdown: In progress`, leaving tip metadata ahead of flushed coins. Avoid by using `-connect=0` during smoke, or wait for IBD to quiesce before `stop`. Recovery: `-reindex-chainstate`. |
+| **Large txindex migration logs** | Progress logs every 1M entries (`dbwrapper_leveldb_migrate.cpp`). Older builds logged every 100k entries and could trigger `Excessive logging detected` suppression for ~1B-entry txindex (~3 min of suppressed disk logs); cosmetic only. |
+| **Shutdown flush observability** | Shutdown logs `Flushing chainstate to disk on shutdown...` before the final `FlushStateMode::ALWAYS` passes; large flushes also emit the existing `Flushing large (N GiB) UTXO set` warning. |
+
 #### Remaining work
 
 - [ ] Document production map-size guidance for very large UTXO sets.
@@ -278,9 +304,9 @@ Introduce sub-locks (`cs_block_index`, `cs_chainstate`) only where ordering is p
 #### Verification gates
 
 - [x] Unit tests: `blockmanager_tests`, `blockchain_tests`, `cs_main_locking_tests`, `caches_tests`, `utxo_zstd_tests`, `zstd_tests`, `dbwrapper_tests`
-- [~] `validation_block_tests` — passes in isolation; `processnewblock_signals_ordering` is **intermittently flaky** under parallel `ProcessNewBlock` (lock-order fix applied 2026-06-27; still under investigation)
+- [~] `validation_block_tests` — passes in isolation; `processnewblock_signals_ordering` **~90–95% pass @ 120s** post-P0-1 (was ~20%); P0-1 `cs_main`/`m_chainstate_mutex` deadlock fixed; remaining ~5–10% flake tracked separately (validation-interface ordering / test harness, not P0-1)
 - [~] `validation_chainstatemanager_tests` — assumeutxo snapshot tests require LMDB reader-slot hygiene (`mdb_reader_check` before read txns)
-- [ ] First-start LevelDB → LMDB migration on a real Core datadir (`~/.bitcoin-swords` prepared; not yet run)
+- [x] First-start LevelDB → LMDB migration on a real Core datadir (`~/.bitcoin-swords`, 2026-06-27): blocks/index 921108 entries/341ms, chainstate 167830082 entries/58s, txindex 1246227219 entries/488s; `Loaded best chain` height=915951; `*.leveldb.bak` created; second start skips migration; first-start RPC `gettxoutsetinfo` `hash_serialized_3=6966e63cfaba6fef05aab3f5d260d4152a306451d8f9b4e4e27dba84f950faa4`; smoke procedure documented (`-connect=0`); post-smoke IBD/shutdown inconsistency recovered via `-reindex-chainstate`
 - [ ] `test/functional/` full suite
 - [ ] ThreadSanitizer CI job
 - [ ] Reproducible chainstate hash comparison against Knots on a fixed block range

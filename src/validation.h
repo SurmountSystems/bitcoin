@@ -704,6 +704,9 @@ public:
     //! Unconditionally flush all changes to disk.
     void ForceFlushStateToDisk();
 
+    //! @see ForceFlushStateToDisk. Caller must hold cs_main (exactly once).
+    void ForceFlushStateToDiskLocked() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     //! Prune blockfiles from the disk if necessary and then flush chainstate changes
     //! if we pruned.
     void PruneAndFlush();

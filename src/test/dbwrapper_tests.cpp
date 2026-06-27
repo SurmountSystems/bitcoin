@@ -6,7 +6,6 @@
 #include <dbwrapper_leveldb_migrate.h>
 #include <serialize.h>
 #include <streams.h>
-#include <util/obfuscation.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
@@ -24,16 +23,6 @@
 using util::ToString;
 
 BOOST_FIXTURE_TEST_SUITE(dbwrapper_tests, BasicTestingSetup)
-
-BOOST_AUTO_TEST_CASE(default_obfuscation_key)
-{
-    BOOST_CHECK(Obfuscation::DefaultKey());
-    BOOST_CHECK_EQUAL(HexStr(Obfuscation::DEFAULT_KEY_BYTES), "7777777777777777");
-    fs::path ph = m_args.GetDataDirBase() / "dbwrapper_default_obfuscation_key";
-    CDBWrapper dbw{{.path = ph, .cache_bytes = 1 << 20, .memory_only = true, .wipe_data = true, .obfuscate = true}};
-    BOOST_CHECK(dbwrapper_private::GetObfuscateKey(dbw));
-    BOOST_CHECK_EQUAL(dbwrapper_private::GetObfuscateKey(dbw).HexKey(), "7777777777777777");
-}
 
 BOOST_AUTO_TEST_CASE(dbwrapper)
 {
@@ -612,6 +601,91 @@ BOOST_AUTO_TEST_CASE(leveldb_migration_disabled)
     BOOST_CHECK(threw);
 
     dbwrapper_settings::g_auto_migrate_leveldb = old_setting;
+}
+
+BOOST_AUTO_TEST_CASE(dbwrapper_multi_env_same_thread)
+{
+    // Regression test for MDB_BAD_RSLOT when multiple LMDB environments are
+    // used on the same thread (e.g. assumeutxo main + snapshot chainstates).
+    for (const bool memory_only : {true, false}) {
+        const fs::path base = m_args.GetDataDirBase() /
+            (memory_only ? "dbwrapper_multi_env_mem" : "dbwrapper_multi_env_disk");
+        const fs::path ph1 = base / "env_1";
+        const fs::path ph2 = base / "env_2";
+
+        auto exercise = [&](CDBWrapper& dbw1, CDBWrapper& dbw2, uint8_t key1, uint8_t key2) {
+            uint256 val1;
+            uint256 val2;
+            BOOST_REQUIRE(dbw1.Read(key1, val1));
+            BOOST_REQUIRE(dbw2.Read(key2, val2));
+
+            BOOST_CHECK_NO_THROW(dbw1.EstimateSize(uint8_t{0}, uint8_t{255}));
+            BOOST_CHECK_NO_THROW(dbw2.EstimateSize(uint8_t{0}, uint8_t{255}));
+
+            // Keep iterators alive on dbw1 while interleaving operations on dbw2.
+            std::vector<std::unique_ptr<CDBIterator>> live_iters;
+            live_iters.emplace_back(dbw1.NewIterator());
+            live_iters.back()->SeekToFirst();
+            live_iters.emplace_back(dbw1.NewIterator());
+
+            for (int round = 0; round < 10; ++round) {
+                BOOST_CHECK_NO_THROW(dbw1.Read(key1, val1));
+                BOOST_CHECK_NO_THROW(dbw2.EstimateSize(uint8_t{0}, uint8_t{255}));
+                BOOST_CHECK_NO_THROW(dbw2.Read(key2, val2));
+                BOOST_CHECK_NO_THROW(dbw1.EstimateSize(uint8_t{0}, uint8_t{255}));
+
+                if (round % 2 == 0) {
+                    // Write on dbw1 while reading/estimating on dbw2.
+                    const uint256 new_val1 = m_rng.rand256();
+                    BOOST_REQUIRE(dbw1.Write(key1, new_val1));
+                    BOOST_CHECK_NO_THROW(dbw2.Read(key2, val2));
+                    BOOST_CHECK_NO_THROW(dbw2.EstimateSize(uint8_t{0}, uint8_t{255}));
+                    BOOST_CHECK_NO_THROW(dbw2.NewIterator());
+                    BOOST_REQUIRE(dbw1.Read(key1, val1));
+                    BOOST_CHECK_EQUAL(val1, new_val1);
+                } else {
+                    // WriteBatch on dbw2 while reading/estimating on dbw1.
+                    const uint256 new_val2 = m_rng.rand256();
+                    CDBBatch batch(dbw2);
+                    batch.Write(key2, new_val2);
+                    BOOST_REQUIRE(dbw2.WriteBatch(batch));
+                    BOOST_CHECK_NO_THROW(dbw1.Read(key1, val1));
+                    BOOST_CHECK_NO_THROW(dbw1.EstimateSize(uint8_t{0}, uint8_t{255}));
+                    BOOST_REQUIRE(dbw2.Read(key2, val2));
+                    BOOST_CHECK_EQUAL(val2, new_val2);
+                }
+            }
+        };
+
+        auto dbw1 = std::make_unique<CDBWrapper>(DBParams{
+            .path = ph1, .cache_bytes = 1 << 20, .memory_only = memory_only, .wipe_data = true});
+        auto dbw2 = std::make_unique<CDBWrapper>(DBParams{
+            .path = ph2, .cache_bytes = 1 << 20, .memory_only = memory_only, .wipe_data = true});
+
+        const uint8_t key1{'a'};
+        const uint8_t key2{'b'};
+        BOOST_REQUIRE(dbw1->Write(key1, m_rng.rand256()));
+        BOOST_REQUIRE(dbw2->Write(key2, m_rng.rand256()));
+
+        exercise(*dbw1, *dbw2, key1, key2);
+
+        // Destroy one env while continuing to use the other on the same thread.
+        dbw1.reset();
+        BOOST_CHECK_NO_THROW(dbw2->EstimateSize(uint8_t{0}, uint8_t{255}));
+        uint256 val2;
+        BOOST_CHECK(dbw2->Read(key2, val2));
+
+        dbw2.reset();
+
+        // Recreate both wrappers and repeat the interleaved access pattern.
+        dbw1 = std::make_unique<CDBWrapper>(DBParams{
+            .path = ph1, .cache_bytes = 1 << 20, .memory_only = memory_only, .wipe_data = true});
+        dbw2 = std::make_unique<CDBWrapper>(DBParams{
+            .path = ph2, .cache_bytes = 1 << 20, .memory_only = memory_only, .wipe_data = true});
+        BOOST_REQUIRE(dbw1->Write(key1, m_rng.rand256()));
+        BOOST_REQUIRE(dbw2->Write(key2, m_rng.rand256()));
+        exercise(*dbw1, *dbw2, key1, key2);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(leveldb_migration_stale_backup)

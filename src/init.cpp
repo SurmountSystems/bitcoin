@@ -370,6 +370,7 @@ void Shutdown(NodeContext& node)
         LOCK(cs_main);
         for (Chainstate* chainstate : node.chainman->GetAll()) {
             if (chainstate->CanFlushToDisk()) {
+                LogPrintf("Flushing chainstate to disk on shutdown...\n");
                 BlockValidationState state;
                 chainstate->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
             }
@@ -397,6 +398,7 @@ void Shutdown(NodeContext& node)
         LOCK(cs_main);
         for (Chainstate* chainstate : node.chainman->GetAll()) {
             if (chainstate->CanFlushToDisk()) {
+                LogPrintf("Flushing chainstate to disk on shutdown (final)...\n");
                 BlockValidationState state;
                 chainstate->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
                 chainstate->ResetCoinsViews();

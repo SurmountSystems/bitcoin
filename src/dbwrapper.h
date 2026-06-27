@@ -146,6 +146,13 @@ public:
     size_t SizeEstimate() const { return size_estimate; }
 };
 
+/**
+ * Database iterator. Holds a dedicated LMDB read transaction and cursor.
+ *
+ * Iterators must not outlive their parent CDBWrapper: destroy all iterators
+ * before the wrapper is destroyed, or behavior is undefined (use-after-close
+ * on the underlying MDB_env).
+ */
 class CDBIterator
 {
 public:
@@ -307,6 +314,10 @@ public:
     // Get an estimate of LMDB map usage (in bytes).
     size_t DynamicMemoryUsage() const;
 
+    /**
+     * Return a new iterator. The caller owns the returned pointer and must
+     * delete it before destroying this CDBWrapper.
+     */
     CDBIterator* NewIterator();
 
     /**

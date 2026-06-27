@@ -157,3 +157,5 @@ When `flags & 0x01`, the payload is zstd-compressed using the bundled block dict
 **Bundled zstd dictionaries** (not in the datadir): shipped under the binary install prefix at `share/swords/blk.dict` and `share/swords/utxo.dict` (or the source tree during development). Override with `-blockzstddict` / `-utxozstddict`. See [design/swords.md](design/swords.md).
 
 **LMDB layout:** Each database directory (`chainstate/`, `blocks/index/`, `indexes/...`) contains `data.mdb` and `lock.mdb`. Map size is derived from `-dbcache` or set explicitly with `-dbmapsize`. Legacy LevelDB directories are migrated automatically on startup (`-migrateleveldb=1`, default) with backup to `*.leveldb.bak/`.
+
+**Migration smoke (brief):** Use a test datadir, not production. Start with `-connect=0` so no IBD runs during verification; call `getblockchaininfo` (and optionally `gettxoutsetinfo`), then `stop` immediately. Second start should open LMDB directly with no new migration lines. See [design/swords.md](design/swords.md) for the full procedure and shutdown/IBD caveats.

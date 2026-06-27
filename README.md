@@ -10,13 +10,13 @@ See the [design document](doc/design/swords.md) for architecture, reasoning, and
 | Feature | Status | Summary |
 |---------|--------|---------|
 | **blk*.dat zstd compression** | Implemented (code) | Per-block zstd dictionary compression; legacy 8-byte headers still readable; bundled dict is a placeholder |
-| **LevelDB → LMDB** | Implemented (code) | `CDBWrapper` uses LMDB with automatic migration from LevelDB; **not yet exercised on a real datadir** |
+| **LevelDB → LMDB** | Implemented (code + smoke) | `CDBWrapper` uses LMDB with automatic migration from LevelDB; **exercised 2026-06-27** on `~/.bitcoin-swords` (blocks/index, chainstate, txindex → LMDB; `*.leveldb.bak` created; second start skips re-migration) |
 | **Expanded caches + UTXO zstd** | Implemented (code) | Up to 48 GiB auto dbcache; IBD/synced profiles; UTXO zstd at LMDB boundary |
 | **cs_main locking** | Implemented (Phase B, partial verify) | Shorter critical sections; lock-order fix applied; parallel validation test still flaky |
 
 **Not production-ready.** Unit tests cover most Swords paths, but `validation_block_tests` is intermittently flaky, `validation_chainstatemanager_tests` (assumeutxo) currently fails against LMDB, functional tests and mainnet migration have not been run. See [doc/design/swords.md](doc/design/swords.md) verification gates.
 
-**Dedicated datadir:** `~/.bitcoin-swords` (hardlink clone from Core v30; `bitcoin.conf` present; first `bitcoind` start not yet attempted).
+**Dedicated datadir:** `~/.bitcoin-swords` (hardlink clone from Core v30; `bitcoin.conf` present). First-start migration completed 2026-06-27; datadir is LMDB-active (`data.mdb` in chainstate, blocks/index, indexes/txindex). Use `-connect=0` for migration smoke — see [doc/design/swords.md](doc/design/swords.md).
 
 ### Example high-RAM configuration
 

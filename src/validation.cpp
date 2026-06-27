@@ -2188,7 +2188,7 @@ MempoolAcceptResult AcceptToMemoryPool(Chainstate& active_chainstate, const CTra
     }
     // After we've (potentially) uncached entries, ensure our coins cache is still within its size limits
     BlockValidationState state_dummy;
-    active_chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
+    active_chainstate.FlushStateToDiskLocked(state_dummy, FlushStateMode::PERIODIC);
     return result;
 }
 
@@ -2220,7 +2220,7 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
     }
     // Ensure the coins cache is still within limits.
     BlockValidationState state_dummy;
-    active_chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
+    active_chainstate.FlushStateToDiskLocked(state_dummy, FlushStateMode::PERIODIC);
     return result;
 }
 
@@ -3153,6 +3153,15 @@ bool Chainstate::FlushStateToDiskLocked(
     CBlockLocator locator_on_flush;
     ChainstateRole role_on_flush{ChainstateRole::NORMAL};
 
+    // Restores cs_main after LEAVE_CRITICAL_SECTION if an exception escapes the I/O section.
+    struct CsMainLeaveGuard {
+        bool m_left{false};
+        ~CsMainLeaveGuard()
+        {
+            if (m_left) ENTER_CRITICAL_SECTION(cs_main);
+        }
+    } cs_main_leave_guard;
+
     try {
         assert(this->CanFlushToDisk());
 
@@ -3235,20 +3244,19 @@ bool Chainstate::FlushStateToDiskLocked(
         }
 
         if (should_write) {
-            // Release cs_main during block-index I/O. Snapshot already taken above; never
-            // acquire cs_main while holding m_cs_block_index_write (lock-order inversion).
-            LEAVE_CRITICAL_SECTION(cs_main);
-
             {
                 LOG_TIME_MILLIS_WITH_CATEGORY("write block and undo data to disk", BCLog::BENCH);
 
-                // First make sure all block and undo data is flushed to disk.
-                // TODO: Handle return error, or add detailed comment why it is
-                // safe to not return an error upon failure.
+                // Flush block files under cs_main (same cs_main → cs_LastBlockFile order as AcceptBlock).
                 if (!m_blockman.FlushChainstateBlockFile(tip_height)) {
-                    LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "%s: Failed to flush block file.\n", __func__);
+                    return FatalError(m_chainman.GetNotifications(), state, _("Failed to flush block file."));
                 }
             }
+
+            // Release cs_main during block-index LMDB I/O. Snapshot already taken above; never
+            // acquire cs_main while holding m_cs_block_index_write (lock-order inversion).
+            LEAVE_CRITICAL_SECTION(cs_main);
+            cs_main_leave_guard.m_left = true;
 
             bool block_index_written{false};
             {
@@ -3262,10 +3270,12 @@ bool Chainstate::FlushStateToDiskLocked(
                 m_blockman.CommitBlockIndexWriteBatch(block_index_batch);
             } else {
                 ENTER_CRITICAL_SECTION(cs_main);
+                cs_main_leave_guard.m_left = false;
                 return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to block index database."));
             }
 
             ENTER_CRITICAL_SECTION(cs_main);
+            cs_main_leave_guard.m_left = false;
 
             if (fFlushForPrune) {
                 LOG_TIME_MILLIS_WITH_CATEGORY("unlink pruned files", BCLog::BENCH);
@@ -3307,6 +3317,15 @@ void Chainstate::ForceFlushStateToDisk()
 {
     BlockValidationState state;
     if (!this->FlushStateToDisk(state, FlushStateMode::ALWAYS)) {
+        LogWarning("Failed to force flush state (%s)", state.ToString());
+    }
+}
+
+void Chainstate::ForceFlushStateToDiskLocked()
+{
+    AssertLockHeld(cs_main);
+    BlockValidationState state;
+    if (!this->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS)) {
         LogWarning("Failed to force flush state (%s)", state.ToString());
     }
 }
@@ -3919,7 +3938,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
     // because this function periodically releases cs_main so that it does not lock up other threads for too long
     // during large connects - and to allow for e.g. the callback queue to drain
     // we use m_chainstate_mutex to enforce mutual exclusion so that only one caller may execute this function at a time
-    LOCK(m_chainstate_mutex);
+    WAIT_LOCK(m_chainstate_mutex, chainstate_mutex_lock);
 
     // Belt-and-suspenders check that we aren't attempting to advance the background
     // chainstate past the snapshot base block.
@@ -3936,10 +3955,15 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // Block until the validation queue drains. This should largely
         // never happen in normal operation, however may happen during
         // reindex, causing memory blowup if we run too far ahead.
-        // Note that if a validationinterface callback ends up calling
-        // ActivateBestChain this may lead to a deadlock! We should
-        // probably have a DEBUG_LOCKORDER test for this in the future.
-        if (m_chainman.m_options.signals) LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
+        // Drain the validation queue without holding m_chainstate_mutex so callbacks
+        // that re-enter ActivateBestChain (or otherwise need this mutex) cannot deadlock.
+        // Chain updates remain serialized on cs_main; releasing this mutex only allows
+        // another thread to wait on cs_main while we drain callbacks (UpdatedBlockTip
+        // ordering is still enforced by enqueue-under-cs_main above).
+        if (m_chainman.m_options.signals) {
+            REVERSE_LOCK(chainstate_mutex_lock);
+            LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
+        }
 
         {
             LOCK(cs_main);
@@ -4038,9 +4062,15 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             m_chainman.ApplySyncedCacheProfile();
         }
 
-        // Write changes periodically to disk, after relay.
-        if (!FlushStateToDisk(state, FlushStateMode::PERIODIC)) {
-            return false;
+        // Write changes periodically to disk, after relay. Release m_chainstate_mutex
+        // during flush so parallel ProcessNewBlock threads are not stuck holding cs_main
+        // while waiting for this mutex (deadlock with flush re-acquiring cs_main).
+        // cs_main is not held here; FlushStateToDisk acquires it for the flush path.
+        {
+            REVERSE_LOCK(chainstate_mutex_lock);
+            if (!FlushStateToDisk(state, FlushStateMode::PERIODIC)) {
+                return false;
+            }
         }
 
         if (WITH_LOCK(::cs_main, return m_disabled)) {
@@ -4117,7 +4147,7 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
     // We do not allow ActivateBestChain() to run while InvalidateBlock() is
     // running, as that could cause the tip to change while we disconnect
     // blocks.
-    LOCK(m_chainstate_mutex);
+    WAIT_LOCK(m_chainstate_mutex, chainstate_mutex_lock);
 
     // We'll be acquiring and releasing cs_main below, to allow the validation
     // callbacks to run. However, we should keep the block index in a
@@ -4151,7 +4181,12 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
         if (m_chainman.m_interrupt) break;
 
         // Make sure the queue of validation callbacks doesn't grow unboundedly.
-        if (m_chainman.m_options.signals) LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
+        // Same pattern as ActivateBestChain: release m_chainstate_mutex so callbacks
+        // that re-enter validation cannot deadlock on this mutex.
+        if (m_chainman.m_options.signals) {
+            REVERSE_LOCK(chainstate_mutex_lock);
+            LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
+        }
 
         LOCK(cs_main);
         // Lock for as long as disconnectpool is in scope to make sure MaybeUpdateMempoolForReorg is
@@ -5063,14 +5098,9 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         return FatalError(GetNotifications(), state, strprintf(_("System error while saving block to disk: %s"), e.what()));
     }
 
-    // TODO: FlushStateToDisk() handles flushing of both block and chainstate
-    // data, so we should move this to ChainstateManager so that we can be more
-    // intelligent about how we flush.
-    // For now, since FlushStateMode::NONE is used, all that can happen is that
-    // the block files may be pruned, so we can just call this on one
-    // chainstate (particularly if we haven't implemented pruning with
-    // background validation yet).
-    ActiveChainstate().FlushStateToDiskLocked(state, FlushStateMode::NONE);
+    // Prune/flush is handled by ActivateBestChain's periodic FlushStateToDisk after
+    // cs_main is released. Do not flush here while holding cs_main (deadlock risk
+    // with parallel ProcessNewBlock + block-index write paths).
 
     CheckBlockIndex();
 
@@ -6747,7 +6777,7 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation()
     assert(this->GetAll().size() == 2);
 
     CCoinsViewDB& ibd_coins_db = m_ibd_chainstate->CoinsDB();
-    m_ibd_chainstate->ForceFlushStateToDisk();
+    m_ibd_chainstate->ForceFlushStateToDiskLocked();
 
     const auto& maybe_au_data = m_options.chainparams.AssumeutxoForHeight(curr_height);
     if (!maybe_au_data) {
@@ -6844,7 +6874,7 @@ void ChainstateManager::ApplySyncedCacheProfile()
               m_synced_cache_sizes.block_tree_db * (1.0 / 1024 / 1024));
 
     BlockValidationState state;
-    if (!ActiveChainstate().FlushStateToDisk(state, FlushStateMode::IF_NEEDED)) {
+    if (!ActiveChainstate().FlushStateToDiskLocked(state, FlushStateMode::IF_NEEDED)) {
         LogWarning("Failed to flush chainstate before shrinking caches after IBD; deferring cache reduction\n");
         m_total_coinstip_cache = old_coinstip;
         m_total_coinsdb_cache = old_coinsdb;

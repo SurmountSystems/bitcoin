@@ -27,6 +27,9 @@ namespace dbwrapper_leveldb_migrate {
 namespace {
 
 static constexpr size_t MIGRATION_BATCH_ENTRIES{10000};
+// Progress logs every N entries. Use 1M (not 100k) so large txindex migrations (~1B+ entries)
+// stay under the log rate-limiter window and avoid "Excessive logging detected" suppression.
+static constexpr uint64_t MIGRATION_PROGRESS_INTERVAL{1'000'000};
 
 std::string LMDBErrorString(int rc)
 {
@@ -285,7 +288,7 @@ std::string MigrateLevelDBToLMDB(const fs::path& path, size_t map_size_bytes, si
                 CommitBatch(env, dbi, batch, map_size);
                 migrated_entries += batch.size();
                 batch.clear();
-                if (migrated_entries % 100000 == 0) {
+                if (migrated_entries % MIGRATION_PROGRESS_INTERVAL == 0) {
                     LogPrintf("... migrated %llu entries (%llu bytes) from %s\n",
                               migrated_entries, migrated_bytes, fs::PathToString(path));
                 }

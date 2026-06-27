@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -107,15 +108,16 @@ size_t CalculateInitialMapSize(const DBParams& params)
     return std::max(MIN_MAP_SIZE, std::max(DEFAULT_MAP_SIZE, cache_hint * 16));
 }
 
-struct TLSCache {
-    MDB_env* env{nullptr};
+struct TLSCacheEntry {
     MDB_txn* txn{nullptr};
     uint64_t epoch{0};
 };
 
-thread_local TLSCache g_tls_cache;
+//! Per-environment read txn cache. A single thread may hold cached read txns for
+//! multiple LMDB environments (e.g. main chainstate + snapshot chainstate).
+thread_local std::map<MDB_env*, TLSCacheEntry> g_tls_read_txns;
 
-void ReleaseTLSReadTxn();
+void ReleaseTLSReadTxn(MDB_env* env);
 
 } // namespace
 
@@ -136,9 +138,9 @@ struct LMDBContext {
 
     ~LMDBContext()
     {
-        if (g_tls_cache.env == env) {
-            ReleaseTLSReadTxn();
-        }
+        // Authoritative TLS read-txn cleanup for this environment. CDBWrapper
+        // destruction must not duplicate this; m_db_context is destroyed last.
+        ReleaseTLSReadTxn(env);
         if (env) {
             if (dbi) mdb_dbi_close(env, dbi);
             mdb_env_close(env);
@@ -148,39 +150,45 @@ struct LMDBContext {
 
 namespace {
 
-void ReleaseTLSReadTxn()
+void ReleaseTLSReadTxn(MDB_env* env)
 {
-    if (g_tls_cache.txn) {
-        mdb_txn_abort(g_tls_cache.txn);
-        g_tls_cache.txn = nullptr;
+    auto it = g_tls_read_txns.find(env);
+    if (it == g_tls_read_txns.end()) return;
+    if (it->second.txn) {
+        mdb_txn_abort(it->second.txn);
+        // mdb_txn_abort returns void in embedded LMDB; verify reader-table hygiene.
+        const int rc = mdb_reader_check(env, nullptr);
+        if (rc != MDB_SUCCESS) {
+            LogError("Reader check after TLS read txn abort failed: %s (%d)", LMDBErrorString(rc), rc);
+        }
     }
-    g_tls_cache.env = nullptr;
-    g_tls_cache.epoch = 0;
+    g_tls_read_txns.erase(it);
 }
 
 MDB_txn* BeginReadTxn(const LMDBContext& ctx)
 {
     const uint64_t epoch = ctx.read_epoch.load(std::memory_order_acquire);
-    if (g_tls_cache.env == ctx.env && g_tls_cache.txn && g_tls_cache.epoch == epoch) {
-        return g_tls_cache.txn;
+    auto it = g_tls_read_txns.find(ctx.env);
+    if (it != g_tls_read_txns.end() && it->second.txn && it->second.epoch == epoch) {
+        return it->second.txn;
     }
-    ReleaseTLSReadTxn();
+    if (it != g_tls_read_txns.end()) {
+        ReleaseTLSReadTxn(ctx.env);
+    }
     HandleLMDBError(mdb_reader_check(ctx.env, nullptr), "read reader check");
     MDB_txn* txn{nullptr};
     const int rc = mdb_txn_begin(ctx.env, nullptr, MDB_RDONLY, &txn);
     HandleLMDBError(rc, "read transaction begin");
-    g_tls_cache.env = ctx.env;
-    g_tls_cache.txn = txn;
-    g_tls_cache.epoch = epoch;
+    TLSCacheEntry& entry = g_tls_read_txns[ctx.env];
+    entry.txn = txn;
+    entry.epoch = epoch;
     return txn;
 }
 
 void InvalidateReadTxns(LMDBContext& ctx)
 {
     ctx.read_epoch.fetch_add(1, std::memory_order_release);
-    if (g_tls_cache.env == ctx.env) {
-        ReleaseTLSReadTxn();
-    }
+    ReleaseTLSReadTxn(ctx.env);
     HandleLMDBError(mdb_reader_check(ctx.env, nullptr), "reader check");
 }
 
@@ -348,7 +356,17 @@ CDBWrapper::CDBWrapper(const DBParams& params)
     HandleLMDBError(mdb_env_set_mapsize(ctx.env, ctx.map_size), "set mapsize");
     HandleLMDBError(mdb_env_set_maxreaders(ctx.env, std::max<size_t>(64, params.cache_bytes / (2 << 20))), "set maxreaders");
 
-    unsigned int env_flags = MDB_NORDAHEAD;
+    // MDB_NOTLS ties reader slots to txn objects instead of pthread TLS, which
+    // avoids MDB_BAD_RSLOT when a thread uses multiple LMDB environments (e.g.
+    // main chainstate + assumeutxo snapshot chainstate).
+    //
+    // This flag applies to every CDBWrapper/LMDB environment in the node, not
+    // only chainstate. With MDB_NOTLS, each active read txn or iterator holds a
+    // reader slot until aborted; LMDB documents extra reader-table locking
+    // overhead vs the default pthread-TLS model. maxreaders is set above from
+    // cache_bytes; if MDB_READERS_FULL is observed under heavy RPC + validation
+    // concurrency, consider raising -dbcache (which scales maxreaders).
+    unsigned int env_flags = MDB_NORDAHEAD | MDB_NOTLS;
     if (!params.memory_only) {
         env_flags |= MDB_NOSYNC;
     }
@@ -385,10 +403,6 @@ CDBWrapper::CDBWrapper(const DBParams& params)
 
 CDBWrapper::~CDBWrapper()
 {
-    if (g_tls_cache.env == DBContext().env && g_tls_cache.txn) {
-        mdb_txn_abort(g_tls_cache.txn);
-        g_tls_cache = {};
-    }
     if (m_is_memory && !m_storage_path.empty()) {
         std::error_code ec;
         fs::remove_all(m_storage_path, ec);
@@ -486,9 +500,7 @@ const std::string CDBWrapper::OBFUSCATE_KEY_KEY("\000obfuscate_key", 14);
 
 std::vector<unsigned char> CDBWrapper::CreateObfuscateKey() const
 {
-    return std::vector<unsigned char>{
-        reinterpret_cast<const unsigned char*>(Obfuscation::DEFAULT_KEY_BYTES.data()),
-        reinterpret_cast<const unsigned char*>(Obfuscation::DEFAULT_KEY_BYTES.data()) + Obfuscation::KEY_SIZE};
+    return FastRandomContext{}.randbytes(Obfuscation::KEY_SIZE);
 }
 
 std::optional<std::string> CDBWrapper::ReadImpl(Span<const std::byte> key) const
@@ -513,7 +525,7 @@ bool CDBWrapper::ExistsImpl(Span<const std::byte> key) const
 size_t CDBWrapper::EstimateSizeImpl(Span<const std::byte> key1, Span<const std::byte> key2) const
 {
     const auto& ctx = DBContext();
-    ReleaseTLSReadTxn();
+    ReleaseTLSReadTxn(ctx.env);
     HandleLMDBError(mdb_reader_check(ctx.env, nullptr), "estimate reader check");
     MDB_txn* txn{nullptr};
     HandleLMDBError(mdb_txn_begin(ctx.env, nullptr, MDB_RDONLY, &txn), "estimate txn begin");
@@ -555,7 +567,7 @@ struct CDBIterator::IteratorImpl {
 
     IteratorImpl(MDB_env* env, MDB_dbi dbi)
     {
-        ReleaseTLSReadTxn();
+        ReleaseTLSReadTxn(env);
         HandleLMDBError(mdb_reader_check(env, nullptr), "iterator reader check");
         HandleLMDBError(mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn), "iterator txn begin");
         HandleLMDBError(mdb_cursor_open(txn, dbi, &cursor), "iterator cursor open");

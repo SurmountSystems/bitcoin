@@ -34,6 +34,8 @@ critical sections or introducing finer-grained locking (Bitcoin Swords feature 4
    `LEAVE_CRITICAL_SECTION` / `ENTER_CRITICAL_SECTION` (do not end the RAII scope before `LEAVE`),
    and must not hold `cs_LastBlockFile` (or any other lock) across that `LEAVE`. Callers already
    holding `cs_main` must use `FlushStateToDiskLocked`; `FlushStateToDisk` acquires `cs_main` itself.
+   `ActivateBestChain` must release `m_chainstate_mutex` before calling `FlushStateToDisk` (flush takes
+   `cs_main`; parallel `ProcessNewBlock` may hold `cs_main` while waiting on `m_chainstate_mutex`).
 
 7. **No validation outcome changes** — Block acceptance order, rejection reasons, and chainstate
    hashes must remain identical to unmodified Knots.

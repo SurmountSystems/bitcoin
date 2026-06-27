@@ -697,7 +697,7 @@ static RPCHelpMan sweepprivkeys()
                     node.mempool->FindScriptPubKey(needles, coins);
                 }
                 Chainstate& active_chainstate = chainman.ActiveChainstate();
-                active_chainstate.ForceFlushStateToDisk();
+                active_chainstate.ForceFlushStateToDiskLocked();
                 pcursor = std::unique_ptr<CCoinsViewCursor>(active_chainstate.CoinsDB().Cursor());
                 CHECK_NONFATAL(pcursor);
             }
