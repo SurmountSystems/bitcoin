@@ -60,6 +60,18 @@ Subdirectory       | File(s)               | Description
 `indexes/blockfilter/basic/db/` | LMDB database (`data.mdb`, `lock.mdb`) | Blockfilter index database for the basic filtertype; *optional*, used if `-blockfilterindex=basic`
 `indexes/blockfilter/basic/`    | `fltrNNNNN.dat`<sup>[\[2\]](#note2)</sup> | Blockfilter index filters for the basic filtertype; *optional*, used if `-blockfilterindex=basic`
 `indexes/coinstats/db/` | LMDB database (`data.mdb`, `lock.mdb`) | Coinstats index; *optional*, used if `-coinstatsindex=1`
+
+### LMDB XOR obfuscation per database (Swords)
+
+Application-layer XOR at the LMDB value layer (`CDBWrapper` `f_obfuscate`). Block/undo `*.dat` files use a separate rolling XOR via `blocks/xor.dat`.
+
+| Database path | XOR enabled | Source |
+|---------------|-------------|--------|
+| `chainstate/` | yes | `src/validation.cpp` |
+| `blocks/index/` | yes | `src/init.cpp` |
+| `indexes/txindex/` | yes | `src/index/txindex.cpp` |
+| `indexes/blockfilter/.../db/` | no (upstream default) | `src/index/blockfilterindex.cpp` |
+| `indexes/coinstats/db/` | no (upstream default) | `src/index/coinstatsindex.cpp` |
 `wallets/`         |                       | [Contains wallets](#multi-wallet-environment); can be specified by `-walletdir` option; if `wallets/` subdirectory does not exist, wallets reside in the [data directory](#data-directory-location)
 `./`               | `anchors.dat`         | Anchor IP address database, created on shutdown and deleted at startup. Anchors are last known outgoing block-relay-only peers that are tried to re-connect to on startup
 `./`               | `banlist.json`        | Stores the addresses/subnets of banned nodes.

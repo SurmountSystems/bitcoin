@@ -169,6 +169,15 @@ BOOST_AUTO_TEST_CASE(blockfile_format_legacy_and_extended)
     extended_prefix[7] = 0x00;
     extended_prefix[8] = 0x00; // stored size 80 LE
     BOOST_CHECK(!ParseBlockDiskHeader(*params, BLOCK_SERIALIZATION_HEADER_SIZE, extended_prefix, header));
+
+    // Extended uncompressed header must win over a legacy misread when five post-magic bytes are available.
+    // (LoadExternalBlockFile used to pass only four bytes, misreading flags=0 + size as legacy size.)
+    std::array<uint8_t, 5> extended_uncompressed_post_magic{0x00, 0x2c, 0x01, 0x00, 0x00}; // flags=0, size=300 LE
+    uint32_t extended_payload_offset{0};
+    BOOST_CHECK(ParseBlockDiskHeaderAfterMagic(*params, 0, extended_uncompressed_post_magic, header, extended_payload_offset));
+    BOOST_CHECK(!header.legacy_format);
+    BOOST_CHECK_EQUAL(header.stored_size, 300U);
+    BOOST_CHECK_EQUAL(extended_payload_offset, BLOCK_SERIALIZATION_HEADER_SIZE);
 }
 
 BOOST_AUTO_TEST_CASE(blockmanager_legacy_write_format)

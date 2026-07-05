@@ -55,6 +55,7 @@
 #include <txmempool.h>
 #include <uint256.h>
 #include <undo.h>
+#include <util/benchstats.h>
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
@@ -2302,6 +2303,8 @@ bool ChainstateManager::IsInitialBlockDownload() const
 
 bool ChainstateManager::UpdateIBDStatus()
 {
+    const bool allow_parallel{m_blockman.m_importing.load(std::memory_order_relaxed) || IsInitialBlockDownload()};
+    m_blockman.SetIbdParallelReadsAllowed(allow_parallel);
     if (m_cached_finished_ibd.load(std::memory_order_relaxed))
         return false;
     if (m_blockman.LoadingBlocks()) {
@@ -2937,6 +2940,48 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
     }
 
+    if (!fJustCheck && m_blockman.IbdParallelReadsAllowed()) {
+        const std::vector<COutPoint> uncached_prevouts{CollectBlockPrevouts(block, view)};
+        if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+            util::g_benchstats.coin_prefetch_prevouts.fetch_add(uncached_prevouts.size(), std::memory_order_relaxed);
+        }
+        const CoinsViewOptions& coin_opts{m_chainman.m_options.coins_view};
+        if (uncached_prevouts.size() >= COIN_PREFETCH_PARALLEL_THRESHOLD
+            && coin_opts.coin_prefetch_workers >= 2) {
+            int workers{coin_opts.coin_prefetch_workers};
+            CCoinsViewDB& coins_db{CoinsDB()};
+            const unsigned int max_readers{coins_db.GetMaxReaders()};
+            workers = std::min(workers, static_cast<int>(std::max(1u, max_readers / 4)));
+            if (workers >= 2) {
+                std::vector<PrefetchedCoin> prefetched;
+                bool prefetch_ok{false};
+                {
+                    ReleaseLocksForBlockIo unlock_for_prefetch{m_mempool, /*release_mempool=*/false};
+                    prefetch_ok = ParallelPrefetchCoins(coins_db, uncached_prevouts, prefetched, workers);
+                }
+                if (prefetch_ok) {
+                    const auto warm_start{SteadyClock::now()};
+                    view.WarmCache(std::move(prefetched));
+                    if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+                        const auto us{Ticks<std::chrono::microseconds>(SteadyClock::now() - warm_start)};
+                        util::g_benchstats.coin_prefetch_warm_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+                    }
+                }
+                if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+                    size_t misses{0};
+                    for (const COutPoint& outpoint : uncached_prevouts) {
+                        if (!view.HaveCoinInCache(outpoint)) ++misses;
+                    }
+                    util::g_benchstats.coin_prefetch_misses.fetch_add(misses, std::memory_order_relaxed);
+                }
+            } else if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+                util::g_benchstats.coin_prefetch_misses.fetch_add(uncached_prevouts.size(), std::memory_order_relaxed);
+            }
+        } else if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+            util::g_benchstats.coin_prefetch_misses.fetch_add(uncached_prevouts.size(), std::memory_order_relaxed);
+        }
+    }
+
     std::vector<int> prevheights;
     CAmount nFees = 0;
     int nInputs = 0;
@@ -3110,8 +3155,15 @@ CoinsCacheSizeState Chainstate::GetCoinsCacheSizeState(
 
     //! No need to periodic flush if at least this much space still available.
     static constexpr int64_t MAX_BLOCK_COINSDB_USAGE_BYTES = 10 * 1024 * 1024;  // 10MB
-    int64_t large_threshold =
-        std::max((9 * nTotalSpace) / 10, nTotalSpace - MAX_BLOCK_COINSDB_USAGE_BYTES);
+    int64_t large_threshold;
+    if (m_chainman.IsInitialBlockDownload()) {
+        const int64_t ibd_absolute = m_chainman.m_options.flushutxo_ibd_mib * 1024 * 1024;
+        const int64_t ibd_percent = (15 * nTotalSpace) / 100;
+        large_threshold = std::min(ibd_absolute, ibd_percent);
+    } else {
+        large_threshold =
+            std::max((9 * nTotalSpace) / 10, nTotalSpace - MAX_BLOCK_COINSDB_USAGE_BYTES);
+    }
 
     if (cacheSize > nTotalSpace) {
         LogPrintf("Cache size (%s) exceeds total space (%s)\n", cacheSize, nTotalSpace);
@@ -3129,6 +3181,19 @@ bool Chainstate::FlushStateToDisk(
 {
     LOCK(cs_main);
     return FlushStateToDiskLocked(state, mode, nManualPruneHeight);
+}
+
+bool Chainstate::FlushStateToDiskOnInterrupt(BlockValidationState& state)
+{
+    FlushStateMode mode;
+    {
+        LOCK(::cs_main);
+        if (!CanFlushToDisk()) return true;
+        mode = GetCoinsCacheSizeState() >= CoinsCacheSizeState::LARGE
+            ? FlushStateMode::PERIODIC
+            : FlushStateMode::IF_NEEDED;
+    }
+    return FlushStateToDisk(state, mode);
 }
 
 bool Chainstate::FlushStateToDiskLocked(
@@ -3288,7 +3353,49 @@ bool Chainstate::FlushStateToDiskLocked(
                 LOG_TIME_MILLIS_WITH_CATEGORY(strprintf("write coins cache to disk (%d coins, %.2fKiB)",
                     coins_count, coins_mem_usage >> 10), BCLog::BENCH);
 
-                if (empty_cache ? !CoinsTip().Flush() : !CoinsTip().Sync()) {
+                CCoinsViewDB& coins_db{CoinsDB()};
+                struct SyncFinalBatchGuard {
+                    CCoinsViewDB& m_db;
+                    explicit SyncFinalBatchGuard(CCoinsViewDB& db, bool enable) : m_db(db)
+                    {
+                        if (enable) m_db.SetSyncFinalBatch(true);
+                    }
+                    ~SyncFinalBatchGuard() { m_db.SetSyncFinalBatch(false); }
+                } sync_guard{coins_db, mode == FlushStateMode::ALWAYS};
+
+                const bool will_erase{empty_cache};
+                if (m_chainman.m_options.coins_view.flush_snapshot) {
+                    const bool sync_always{mode == FlushStateMode::ALWAYS};
+                    int stale_attempts{0};
+                    while (true) {
+                        const CoinsFlushSnapshot snapshot{CoinsTip().CaptureFlushSnapshot(will_erase)};
+
+                        LEAVE_CRITICAL_SECTION(cs_main);
+                        cs_main_leave_guard.m_left = true;
+                        bool written{false};
+                        {
+                            // Serialize coins LMDB writes so overlapping flushes cannot regress DB_BEST_BLOCK.
+                            LOCK(m_coins_flush_mutex);
+                            if (sync_always) coins_db.SetSyncFinalBatch(true);
+                            written = coins_db.BatchWriteFromSnapshot(snapshot);
+                        }
+                        ENTER_CRITICAL_SECTION(cs_main);
+                        cs_main_leave_guard.m_left = false;
+
+                        if (!written) {
+                            return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
+                        }
+                        if (CoinsTip().ValidateFlushSnapshot(snapshot)) {
+                            CoinsTip().CommitFlushSnapshot(snapshot);
+                            break;
+                        }
+                        ++stale_attempts;
+                        if (stale_attempts == 1 || stale_attempts % 16 == 0) {
+                            LogDebug(BCLog::COINDB, "UTXO flush snapshot stale after out-of-lock write, retrying (attempt %d)\n",
+                                     stale_attempts);
+                        }
+                    }
+                } else if (will_erase ? !CoinsTip().Flush() : !CoinsTip().Sync()) {
                     return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
                 }
                 full_flush_completed = true;
@@ -3483,18 +3590,18 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     }
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     CBlock& block = *pblock;
+    bool read_ok{false};
     {
-        LEAVE_CRITICAL_SECTION(cs_main);
-        const bool read_ok{m_blockman.ReadBlock(block, block_loc.pos, block_loc.hash)};
-        ENTER_CRITICAL_SECTION(cs_main);
-        if (!read_ok) {
-            LogError("DisconnectTip(): Failed to read block\n");
-            return false;
-        }
-        if (m_chain.Tip() != pindexDelete) {
-            LogError("DisconnectTip(): Chain tip changed during block read\n");
-            return false;
-        }
+        ReleaseLocksForBlockIo unlock_for_io{m_mempool};
+        read_ok = m_blockman.ReadBlock(block, block_loc.pos, block_loc.hash);
+    }
+    if (!read_ok) {
+        LogError("DisconnectTip(): Failed to read block\n");
+        return false;
+    }
+    if (m_chain.Tip() != pindexDelete) {
+        LogError("DisconnectTip(): Chain tip changed during block read\n");
+        return false;
     }
     // Apply the block atomically to the chain state.
     const auto time_start{SteadyClock::now()};
@@ -3619,16 +3726,39 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
             return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
         }
         std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
+        bool read_ok{false};
         {
-            LEAVE_CRITICAL_SECTION(cs_main);
-            const bool read_ok{m_blockman.ReadBlock(*pblockNew, block_loc.pos, block_loc.hash)};
-            ENTER_CRITICAL_SECTION(cs_main);
+            ReleaseLocksForBlockIo unlock_for_io{m_mempool};
+            if (pindexNew->pprev == m_chain.Tip()) {
+                const auto prefetch_start{SteadyClock::now()};
+                if (auto prefetched{m_blockman.PrefetchQueue().TakeIfReady(block_loc)}) {
+                    if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+                        util::g_benchstats.block_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    try {
+                        SpanReader{*prefetched} >> TX_WITH_WITNESS(*pblockNew);
+                        const auto block_hash{pblockNew->GetHash()};
+                        read_ok = CheckProofOfWork(block_hash, pblockNew->nBits, m_chainman.GetConsensus())
+                            && block_hash == block_loc.hash
+                            && (!m_chainman.GetConsensus().signet_blocks
+                                || CheckSignetBlockSolution(*pblockNew, m_chainman.GetConsensus()));
+                    } catch (const std::exception&) {
+                        read_ok = false;
+                    }
+                } else if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+                    const auto us{Ticks<std::chrono::microseconds>(SteadyClock::now() - prefetch_start)};
+                    util::g_benchstats.block_prefetch_wait_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+                }
+            }
             if (!read_ok) {
-                return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
+                read_ok = m_blockman.ReadBlock(*pblockNew, block_loc.pos, block_loc.hash);
             }
-            if (pindexNew->pprev != m_chain.Tip()) {
-                return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
-            }
+        }
+        if (!read_ok) {
+            return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
+        }
+        if (pindexNew->pprev != m_chain.Tip()) {
+            return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
         }
         pthisBlock = pblockNew;
     } else {
@@ -3646,14 +3776,18 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     {
         CCoinsViewCache view(&CoinsTip());
         bool rv = ConnectBlock(blockConnecting, state, pindexNew, view);
-        if (m_chainman.m_options.signals) {
-            m_chainman.m_options.signals->BlockChecked(blockConnecting, state);
-        }
         if (!rv) {
             if (state.IsInvalid())
                 InvalidBlockFound(pindexNew, state);
             LogError("%s: ConnectBlock %s failed, %s\n", __func__, pindexNew->GetBlockHash().ToString(), state.ToString());
             return false;
+        }
+        // Do not merge into CoinsTip after shutdown interrupt; child view is discarded without Flush().
+        if (m_chainman.m_interrupt) {
+            return false;
+        }
+        if (m_chainman.m_options.signals) {
+            m_chainman.m_options.signals->BlockChecked(blockConnecting, state);
         }
         time_3 = SteadyClock::now();
         m_chainman.time_connect_total += time_3 - time_2;
@@ -3715,6 +3849,11 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         // This call may set `m_disabled`, which is referenced immediately afterwards in
         // ActivateBestChain, so that we stop connecting blocks past the snapshot base.
         m_chainman.MaybeCompleteSnapshotValidation();
+    }
+
+    if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+        util::g_benchstats.blocks_connected.fetch_add(1, std::memory_order_relaxed);
+        util::MaybeLogBenchStats();
     }
 
     connectTrace.BlockConnected(pindexNew, std::move(pthisBlock));
@@ -3813,6 +3952,7 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
     // Disconnect active blocks which are no longer in the best chain.
     bool fBlocksDisconnected = false;
     DisconnectedBlockTransactions disconnectpool{MAX_DISCONNECTED_TX_POOL_BYTES};
+    m_blockman.PrefetchQueue().Invalidate();
     while (m_chain.Tip() && m_chain.Tip() != pindexFork) {
         if (!DisconnectTip(state, &disconnectpool)) {
             // This is likely a fatal error, but keep the mempool consistent,
@@ -3846,7 +3986,18 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
         nHeight = nTargetHeight;
 
         // Connect new blocks.
-        for (CBlockIndex* pindexConnect : vpindexToConnect | std::views::reverse) {
+        const auto reversed{vpindexToConnect | std::views::reverse};
+        for (auto it = reversed.begin(); it != reversed.end(); ++it) {
+            CBlockIndex* pindexConnect{*it};
+            const auto next_it{std::next(it)};
+            if (next_it != reversed.end() && !m_chainman.m_interrupt && !pblock
+                && m_blockman.IbdParallelReadsAllowed() && pindexConnect->pprev == m_chain.Tip()) {
+                const node::BlockReadLoc prefetch_loc{m_blockman.CopyBlockReadLocAssumingLockHeld(**next_it)};
+                if (prefetch_loc.IsValid()) {
+                    ReleaseLocksForBlockIo unlock_for_prefetch{m_mempool};
+                    m_blockman.PrefetchQueue().Enqueue(prefetch_loc, m_blockman, m_chainman.m_interrupt);
+                }
+            }
             if (!ConnectTip(state, pindexConnect, pindexConnect == pindexMostWork ? pblock : std::shared_ptr<const CBlock>(), connectTrace, disconnectpool)) {
                 if (state.IsInvalid()) {
                     // The block violates a consensus rule.
@@ -3855,6 +4006,11 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
                     }
                     state = BlockValidationState();
                     fInvalidFound = true;
+                    fContinue = false;
+                    break;
+                } else if (m_chainman.m_interrupt) {
+                    // Graceful shutdown interrupt; stop the outer batch loop so nHeight
+                    // is not advanced past m_chain.Tip() with blocks still unconnected.
                     fContinue = false;
                     break;
                 } else {
@@ -3922,6 +4078,12 @@ static void LimitValidationInterfaceQueue(ValidationSignals& signals) LOCKS_EXCL
     if (signals.CallbacksPending() > 10) {
         signals.SyncWithValidationInterfaceQueue();
     }
+}
+
+void Chainstate::WaitForActivateBestChainDrain()
+{
+    AssertLockNotHeld(m_chainstate_mutex);
+    WAIT_LOCK(m_chainstate_mutex, chainstate_mutex_lock);
 }
 
 bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<const CBlock> pblock)
@@ -3997,6 +4159,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                     // A system error occurred
                     return false;
                 }
+                if (m_chainman.m_interrupt) break;
                 blocks_connected = true;
 
                 if (fInvalidFound) {
@@ -5677,15 +5840,10 @@ void ChainstateManager::LoadExternalBlockFile(
                     continue;
                 }
                 const uint64_t magic_pos{blkdat.GetPos() - sizeof(MessageStartChars)};
-                std::array<uint8_t, 4> post_magic4{};
-                blkdat.read(MakeWritableByteSpan(post_magic4));
-                std::array<uint8_t, 5> post_magic5{};
-                std::copy(post_magic4.begin(), post_magic4.end(), post_magic5.begin());
-                bool parsed{ParseBlockDiskHeaderAfterMagic(params, magic_pos, post_magic4, disk_header, payload_offset)};
-                if (!parsed && post_magic4.size() >= 1 && node::ValidBlockDiskFlags(post_magic4[0])) {
-                    blkdat.read(MakeWritableByteSpan(post_magic5).subspan(4, 1));
-                    parsed = ParseBlockDiskHeaderAfterMagic(params, magic_pos, post_magic5, disk_header, payload_offset);
-                }
+                // Read five bytes so extended headers (magic + flags + size) are tried before legacy.
+                std::array<uint8_t, 5> post_magic{};
+                blkdat.read(MakeWritableByteSpan(post_magic));
+                const bool parsed{ParseBlockDiskHeaderAfterMagic(params, magic_pos, post_magic, disk_header, payload_offset)};
                 if (!parsed) {
                     continue;
                 }

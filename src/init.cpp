@@ -37,6 +37,7 @@
 #include <interfaces/node.h>
 #include <ipc/exception.h>
 #include <kernel/caches.h>
+#include <kernel/chainstatemanager_opts.h>
 #include <kernel/chainparams.h>
 #include <kernel/context.h>
 #include <kernel/warning.h>
@@ -85,6 +86,7 @@
 #include <util/asmap.h>
 #include <util/batchpriority.h>
 #include <util/chaintype.h>
+#include <util/benchstats.h>
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
@@ -331,6 +333,26 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
+    // Shutdown order: drain ABC → pre-flush → connman stop → final ALWAYS flush.
+    bool preflush_failed{false};
+    if (node.chainman) {
+        for (Chainstate* chainstate : node.chainman->GetAll()) {
+            chainstate->WaitForActivateBestChainDrain();
+        }
+        node.chainman->m_blockman.PrefetchQueue().Invalidate();
+        node.chainman->m_blockman.PrefetchQueue().WaitForIdle();
+        node.chainman->m_blockman.StopDecompressPool();
+        util::MaybeLogBenchStats(/*force=*/true);
+        for (Chainstate* chainstate : node.chainman->GetAll()) {
+            LogPrintf("Pre-flushing chainstate to disk on shutdown interrupt...\n");
+            BlockValidationState state;
+            if (!chainstate->FlushStateToDiskOnInterrupt(state)) {
+                LogPrintf("%s: Pre-flush failed (%s)\n", __func__, state.ToString());
+                preflush_failed = true;
+            }
+        }
+    }
+
     // Because these depend on each-other, we make sure that neither can be
     // using the other before destroying them.
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
@@ -366,7 +388,7 @@ void Shutdown(NodeContext& node)
     }
 
     // FlushStateToDisk generates a ChainStateFlushed callback, which we should avoid missing
-    if (node.chainman) {
+    if (node.chainman && !preflush_failed) {
         LOCK(cs_main);
         for (Chainstate* chainstate : node.chainman->GetAll()) {
             if (chainstate->CanFlushToDisk()) {
@@ -375,6 +397,8 @@ void Shutdown(NodeContext& node)
                 chainstate->FlushStateToDiskLocked(state, FlushStateMode::ALWAYS);
             }
         }
+    } else if (preflush_failed) {
+        LogPrintf("%s: Skipping chainstate flush after pre-flush failure\n", __func__);
     }
 
     // After there are no more peers/RPC left to give us new data which may generate
@@ -394,7 +418,7 @@ void Shutdown(NodeContext& node)
     // up with our current chain to avoid any strange pruning edge cases and make
     // next startup faster by avoiding rescan.
 
-    if (node.chainman) {
+    if (node.chainman && !preflush_failed) {
         LOCK(cs_main);
         for (Chainstate* chainstate : node.chainman->GetAll()) {
             if (chainstate->CanFlushToDisk()) {
@@ -540,6 +564,9 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-corepolicy", strprintf("Use Bitcoin Core policy defaults (default: %u)", DEFAULT_COREPOLICY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbbatchsize", strprintf("Maximum database write batch size in bytes (default: %u)", nDefaultDbBatchSize), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-lmdbsync",
+                   "Sync every chainstate LMDB write to disk (mdb_env_sync). Paranoid/debug mode; default is MDB_NOSYNC for steady-state.",
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbcache=<n>", strprintf("Maximum database cache size <n> MiB (minimum %s, default is platform dependent, between %s and %s). Make sure you have enough RAM. In addition, unused memory allocated to the mempool is shared with this cache (see -maxmempool).", MIN_DBCACHE_BYTES / 1_MiB, MIN_DEFAULT_DBCACHE / 1_MiB, MAX_DEFAULT_DBCACHE / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbcache-ibd=<n>", strprintf("Database cache size <n> MiB while initial block download is active (0 = auto, default: ~62.5%% of usable RAM, capped at %s MiB).", MAX_DEFAULT_DBCACHE / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbcache-synced=<n>", strprintf("Database cache size <n> MiB after initial block download completes (0 = auto, default: ~25%% of usable RAM, capped at %s MiB).", MAX_DEFAULT_DBCACHE / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -547,6 +574,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-coinsdbcache=<n>", "Override chainstate database cache / LMDB reader pool budget in MiB (0 = computed default from -dbcache split)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocktreecache=<n>", "Override block index database cache in MiB (0 = computed default from -dbcache split)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reservedram=<n>", strprintf("Reserve <n> MiB of system RAM for non-dbcache usage when computing automatic cache sizes (default: %s).", DEFAULT_RESERVED_RAM / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-flushutxo-ibd-mib=<n>",
+                   strprintf("During initial block download, trigger periodic UTXO flush when dirty cache exceeds min(<n> MiB, 15%% of coinstip+mempool slack) (default: %d; 0 = flush on any dirty cache).",
+                             kernel::DEFAULT_FLUSH_UTXO_IBD_MIB),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbfilesize",
                    strprintf("Target size of files within databases, in MiB (%u to %u, default: %u).",
                              1, 1024,
@@ -568,6 +599,29 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-utxozstddict=<path>",
                    "Path to zstd dictionary for UTXO compression (default: bundled share/swords/utxo.dict)",
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-utxoencodepar=<n>",
+                   strprintf("Parallel UTXO encode worker threads during chainstate flush (0 = auto from -par, "
+                             "1 = serial only, 2-%d = explicit workers; parallel path requires -utxozstd=1 and "
+                             ">=%u dirty entries, default: %d)",
+                             MAX_UTXO_ENCODE_PAR, UTXO_ENCODE_PARALLEL_THRESHOLD, DEFAULT_UTXO_ENCODE_PAR),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-flushsnapshot",
+                   strprintf("Snapshot dirty UTXOs under cs_main and release the lock during LMDB writes "
+                             "(0 = legacy in-lock Flush/Sync, default: %u)", DEFAULT_FLUSH_SNAPSHOT),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-benchstats=<n>",
+                   "Enable IBD read-path benchstats counters (1 = on; logs with debug=bench, default: 0)",
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockdecompresspar=<n>",
+                   strprintf("Parallel block zstd decompress worker threads during IBD reads "
+                             "(0 = auto from -par, 1 = serial only, 2-%d = explicit workers; default: %d)",
+                             kernel::MAX_BLOCK_DECOMPRESS_PAR, kernel::DEFAULT_BLOCK_DECOMPRESS_PAR),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-coinprefetchpar=<n>",
+                   strprintf("Parallel LMDB coin prefetch worker threads during ConnectBlock "
+                             "(0 = auto from -par, 1 = serial only, 2-%d = explicit workers; default: %d)",
+                             MAX_COIN_PREFETCH_PAR, DEFAULT_COIN_PREFETCH_PAR),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-allowignoredconf", strprintf("For backwards compatibility, treat an unused %s file in the datadir as a warning, not an error.", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-loadblock=<file>", "Imports blocks from external file on startup", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1722,6 +1776,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         // Detailed error printed inside StartLogging().
         return false;
     }
+
+    util::g_benchstats_enabled.store(args.GetBoolArg("-benchstats", false), std::memory_order_relaxed);
 
     LogPrintf("Using at most %i automatic connections (%i file descriptors available)\n", nMaxConnections, available_fds);
 

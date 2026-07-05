@@ -14,8 +14,10 @@ critical sections or introducing finer-grained locking (Bitcoin Swords feature 4
    `BlockReadLoc` snapshot taken while the caller holds `cs_main`.
 
 3. **UTXO view consistency** — `CCoinsViewCache` mutations during `ConnectBlock` / `DisconnectBlock`
-   remain serialized under `cs_main`. Coins flushes still run under `cs_main` because the cache
-   cursor references live in-memory state.
+   remain serialized under `cs_main`. Parallel coin prefetch performs read-only LMDB lookups on worker
+   threads; cache mutation happens only on the validation thread via `WarmCache` (never parallel
+   `FetchCoin`). UTXO flush snapshots collect dirty entries under `cs_main`, release the lock
+   during LMDB encode/write, then re-acquire to validate and finalize the cache.
 
 4. **`nChainWork` / `nStatus` atomicity** — P2P relay decisions that consult block index status
    continue to do so under `cs_main`. Only immutable snapshots (position, hash, have-data flags)
@@ -40,7 +42,7 @@ critical sections or introducing finer-grained locking (Bitcoin Swords feature 4
 7. **No validation outcome changes** — Block acceptance order, rejection reasons, and chainstate
    hashes must remain identical to unmodified Knots.
 
-## Phase B patterns (implemented)
+## Short critical sections (implemented)
 
 | Pattern | Usage |
 |---------|-------|
@@ -51,10 +53,17 @@ critical sections or introducing finer-grained locking (Bitcoin Swords feature 4
 | `m_cs_block_index_write` | Mutex serializes LMDB writes; **never** wait on `cs_main` while holding `m_cs_block_index_write` — `FlushStateToDisk` and `WriteBlockIndexDB` snapshot under `cs_main`, `LEAVE`/`release` `cs_main`, write under `m_cs_block_index_write`, then commit under `cs_main` only after releasing the write mutex |
 | Deferred P2P cmpctblock read | Capture `BlockReadLoc` under `cs_main`; read block after the send loop releases the lock |
 
-## Not yet implemented (Phase C+)
+## IBD read parallelism (implemented)
+
+| Pattern | Usage |
+|---------|-------|
+| `BlockDecompressPool` | Parallel zstd payload decompress during IBD reads; serial fallback always available |
+| `BlockPrefetchQueue` | Depth-1 async block read+decompress; invalidated on reorg / interrupt |
+| `ParallelPrefetchCoins` + `WarmCache` | Parallel LMDB coin reads; single-threaded cache merge before tx loop |
+| `benchstats` | `-benchstats=1` counters for disk/decompress/prefetch paths |
+
+## Not yet implemented (finer-grained locks)
 
 - Separate `cs_block_index` / `cs_chainstate` sub-locks
-- UTXO flush without holding `cs_main` during LMDB write
-- IBD decompression worker pool
 
 See [swords.md](swords.md) section 4 for the full roadmap.

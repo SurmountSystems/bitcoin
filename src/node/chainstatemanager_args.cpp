@@ -50,7 +50,7 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, ChainstateManage
     if (auto value{args.GetIntArg("-maxtipage")}) opts.max_tip_age = std::chrono::seconds{*value};
 
     ReadDatabaseArgs(args, opts.coins_db);
-    ReadCoinsViewArgs(args, opts.coins_view);
+    if (auto result{ReadCoinsViewArgs(args, opts.coins_view)}) return result;
 
     int script_threads = args.GetIntArg("-par", DEFAULT_SCRIPTCHECK_THREADS);
     if (script_threads <= 0) {
@@ -60,6 +60,13 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, ChainstateManage
     }
     // Subtract 1 because the main thread counts towards the par threads.
     opts.worker_threads_num = script_threads - 1;
+
+    if (auto value{args.GetIntArg("-flushutxo-ibd-mib")}) {
+        if (*value < 0) {
+            return util::Error{Untranslated(strprintf("Invalid -flushutxo-ibd-mib value (%d), must be >= 0.", *value))};
+        }
+        opts.flushutxo_ibd_mib = *value;
+    }
 
     if (auto max_size = args.GetIntArg("-maxsigcachesize")) {
         // 1. When supplied with a max_size of 0, both the signature cache and

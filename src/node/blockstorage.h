@@ -24,15 +24,20 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -53,6 +58,8 @@ class SignalInterrupt;
 
 namespace node {
 struct BlockIndexWriteBatch;
+class BlockManager;
+
 } // namespace node
 
 namespace kernel {
@@ -129,6 +136,64 @@ struct BlockReadLoc {
     {
         return have_data && pos.nPos >= BLOCK_LEGACY_SERIALIZATION_HEADER_SIZE;
     }
+};
+
+class BlockManager;
+
+/** Worker pool for zstd block payload decompression during IBD reads. */
+class BlockDecompressPool
+{
+public:
+    BlockDecompressPool() = default;
+    ~BlockDecompressPool() { Stop(); }
+
+    void Start(int num_workers, const compress::BlockZstd* zstd);
+    void Stop();
+
+    //! Returns false when the pool is stopped or the job queue is full (caller runs inline).
+    bool Submit(std::span<const uint8_t> compressed, std::vector<uint8_t>& payload, size_t max_output) const;
+
+    bool Active() const { return m_num_workers >= 2; }
+
+private:
+    struct Job {
+        std::span<const uint8_t> compressed;
+        std::vector<uint8_t>* payload{nullptr};
+        size_t max_output{0};
+        std::promise<bool> done;
+    };
+
+    void WorkerLoop();
+
+    mutable std::mutex m_mutex;
+    mutable std::condition_variable m_cv;
+    mutable std::deque<std::unique_ptr<Job>> m_queue;
+    std::vector<std::thread> m_workers;
+    const compress::BlockZstd* m_zstd{nullptr};
+    std::atomic<bool> m_stop{false};
+    int m_num_workers{0};
+    static constexpr size_t MAX_QUEUE_DEPTH{4};
+};
+
+/** Depth-1 async block read + decompress pipeline for ConnectTip. */
+class BlockPrefetchQueue
+{
+public:
+    void Invalidate();
+    void Enqueue(const BlockReadLoc& loc, BlockManager& blockman, const util::SignalInterrupt& interrupt);
+    //! Take a ready prefetched payload when loc matches; otherwise returns nullopt.
+    std::optional<std::vector<uint8_t>> TakeIfReady(const BlockReadLoc& loc);
+    void WaitForIdle();
+
+private:
+    mutable std::mutex m_mutex;
+    std::condition_variable m_cv;
+    BlockReadLoc m_loc;
+    std::vector<uint8_t> m_payload;
+    std::atomic<int> m_active_workers{0};
+    bool m_ready{false};
+    bool m_in_flight{false};
+    uint64_t m_generation{0};
 };
 
 /** Snapshot of block index fields needed to read undo data from disk without holding cs_main. */
@@ -294,6 +359,10 @@ private:
     const Obfuscation m_xor_key;
 
     compress::BlockZstd m_block_zstd;
+    mutable BlockDecompressPool m_decompress_pool;
+    BlockPrefetchQueue m_prefetch_queue;
+    int m_decompress_workers{0};
+    std::atomic<bool> m_ibd_parallel_reads{false};
 
     /** Dirty block index entries. */
     std::set<CBlockIndex*> m_dirty_blockindex;
@@ -510,6 +579,21 @@ public:
 
     /** Decompress a zstd-compressed block payload. Returns false if unavailable or invalid. */
     bool DecompressBlockPayload(std::span<const uint8_t> compressed, std::vector<uint8_t>& payload) const;
+
+    void StopDecompressPool() { m_decompress_pool.Stop(); }
+    BlockPrefetchQueue& PrefetchQueue() { return m_prefetch_queue; }
+
+    void SetIbdParallelReadsAllowed(bool allowed) { m_ibd_parallel_reads.store(allowed, std::memory_order_relaxed); }
+    bool IbdParallelReadsAllowed() const { return m_ibd_parallel_reads.load(std::memory_order_relaxed); }
+
+    void ConfigureDecompressPool(int workers);
+
+    bool ReadRawBlockFromStored(std::vector<uint8_t>& block,
+                                const BlockDiskHeader& header,
+                                std::span<const uint8_t> stored,
+                                bool allow_parallel_decompress) const;
+
+    bool ReadBlockFromPayload(std::vector<uint8_t>& block, const BlockReadLoc& loc, bool lowprio = false) const;
 
     bool ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const;
     bool ReadBlockUndo(CBlockUndo& blockundo, const UndoReadLoc& loc) const;

@@ -98,6 +98,43 @@ enum SpkReuseModes {
 
 extern SpkReuseModes SpkReuseMode;
 
+/**
+ * Release cs_main (and optionally mempool lock when held) for block disk I/O or prefetch joins.
+ * Re-acquires on destruction. Caller must hold cs_main and optionally
+ * m_mempool->cs in that order before construction.
+ */
+class ReleaseLocksForBlockIo
+{
+    CTxMemPool* m_mempool;
+    bool m_release_mempool;
+    bool m_left_mempool{false};
+    bool m_left_cs_main{false};
+
+public:
+    explicit ReleaseLocksForBlockIo(CTxMemPool* mempool, bool release_mempool = true)
+        : m_mempool{mempool}, m_release_mempool{release_mempool}
+    {
+        if (m_release_mempool && m_mempool) {
+            LEAVE_CRITICAL_SECTION(m_mempool->cs);
+            m_left_mempool = true;
+        }
+        LEAVE_CRITICAL_SECTION(cs_main);
+        m_left_cs_main = true;
+    }
+
+    ~ReleaseLocksForBlockIo()
+    {
+        if (m_left_cs_main) {
+            ENTER_CRITICAL_SECTION(cs_main);
+            m_left_cs_main = false;
+        }
+        if (m_left_mempool) {
+            ENTER_CRITICAL_SECTION(m_mempool->cs);
+            m_left_mempool = false;
+        }
+    }
+};
+
 /** Documentation for argument 'checklevel'. */
 extern const std::vector<std::string> CHECKLEVEL_DOC;
 
@@ -674,6 +711,12 @@ public:
     //! The cache size of the in-memory coins view.
     size_t m_coinstip_cache_size_bytes{0};
 
+    /**
+     * Serializes out-of-lock UTXO LMDB writes for the immutable flush snapshot path.
+     * Held only during BatchWriteFromSnapshot (not while cs_main is held).
+     */
+    Mutex m_coins_flush_mutex;
+
     //! Resize the CoinsViews caches dynamically and flush state to disk.
     //! @returns true unless an error occurred during the flush.
     bool ResizeCoinsCaches(size_t coinstip_size, size_t coinsdb_size)
@@ -700,6 +743,15 @@ public:
         BlockValidationState& state,
         FlushStateMode mode,
         int nManualPruneHeight = 0) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * After shutdown interrupt, write dirty UTXO cache incrementally to reduce the
+     * volume of the final ALWAYS flush (no mdb_env_sync; durability remains on ALWAYS).
+     * Uses PERIODIC when the cache is LARGE (may empty cache via Flush), otherwise
+     * IF_NEEDED (Sync when critical). UTXO LMDB writes use an immutable flush
+     * snapshot and release cs_main during encode/write when -flushsnapshot=1 (default).
+     */
+    bool FlushStateToDiskOnInterrupt(BlockValidationState& state);
 
     //! Unconditionally flush all changes to disk.
     void ForceFlushStateToDisk();
@@ -737,6 +789,9 @@ public:
         std::shared_ptr<const CBlock> pblock = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(!m_chainstate_mutex)
         LOCKS_EXCLUDED(::cs_main);
+
+    //! Block until no ActivateBestChain caller holds m_chainstate_mutex (shutdown drain).
+    void WaitForActivateBestChainDrain() EXCLUSIVE_LOCKS_REQUIRED(!m_chainstate_mutex);
 
     // Block (dis)connection on a given view:
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)

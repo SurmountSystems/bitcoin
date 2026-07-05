@@ -19,6 +19,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 util::Result<void> dbwrapper_SanityCheck();
@@ -69,6 +70,8 @@ struct DBParams {
     size_t map_size_bytes{0};
     //! When true, apply the global -dbmapsize override to this database.
     bool use_global_map_size{false};
+    //! Override LMDB max reader slots (0 = derive from cache_bytes). Test-only.
+    unsigned int max_readers{0};
 };
 
 class dbwrapper_error : public std::runtime_error
@@ -76,6 +79,14 @@ class dbwrapper_error : public std::runtime_error
 public:
     explicit dbwrapper_error(const std::string& msg) : std::runtime_error(msg) {}
 };
+
+//! True when an LMDB error is MDB_READERS_FULL (HandleLMDBError formats rc as "… (%d)").
+inline bool IsLMDBReadersFullError(const dbwrapper_error& e)
+{
+    const std::string_view msg{e.what()};
+    return msg.find("(-30790)") != std::string_view::npos
+        || msg.find("maxreaders limit reached") != std::string_view::npos;
+}
 
 class CDBWrapper;
 
@@ -88,6 +99,17 @@ namespace dbwrapper_private {
  * specific database.
  */
 const Obfuscation& GetObfuscateKey(const CDBWrapper&);
+
+/** Records fSync arguments passed to WriteBatch when active (unit tests only). */
+struct WriteBatchSyncLog {
+    bool active{false};
+    std::vector<bool> calls;
+    void Reset()
+    {
+        calls.clear();
+    }
+};
+WriteBatchSyncLog& TestWriteBatchSyncLog();
 
 }; // namespace dbwrapper_private
 
@@ -313,6 +335,9 @@ public:
 
     // Get an estimate of LMDB map usage (in bytes).
     size_t DynamicMemoryUsage() const;
+
+    //! Configured LMDB reader slot limit for this environment.
+    unsigned int GetMaxReaders() const;
 
     /**
      * Return a new iterator. The caller owns the returned pointer and must

@@ -2,7 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/util/coins.h>
+#include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 #include <validation.h>
 #include <validationinterface.h>
 
@@ -97,6 +100,113 @@ BOOST_FIXTURE_TEST_CASE(write_during_multiblock_activation, TestChain100Setup)
     // inside the outer loop.
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
     BOOST_CHECK_EQUAL(sub->m_flushed_at_block, second_from_tip);
+}
+
+//! During IBD, periodic flush uses a lower threshold than synced operation.
+BOOST_FIXTURE_TEST_CASE(ibd_flush_threshold, TestChain100Setup)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    auto& chainstate = chainman.ActiveChainstate();
+
+    // 100 MiB coinstip budget; IBD threshold min(4 GiB default, 15 MiB) = 15 MiB.
+    // Synced threshold max(90 MiB, ~100 MiB - 10 MiB) = 90 MiB.
+    constexpr size_t MAX_COINS_CACHE_BYTES = 100 * 1024 * 1024;
+
+    LOCK(::cs_main);
+    auto& view = chainstate.CoinsTip();
+
+    auto add_coins_until = [&](CoinsCacheSizeState target) {
+        while (chainstate.GetCoinsCacheSizeState(MAX_COINS_CACHE_BYTES, /*max_mempool_size_bytes=*/0) < target) {
+            AddTestCoin(m_rng, view);
+        }
+    };
+
+    chainman.m_cached_finished_ibd.store(false, std::memory_order_relaxed);
+    BOOST_CHECK(chainman.IsInitialBlockDownload());
+
+    add_coins_until(CoinsCacheSizeState::LARGE);
+    BOOST_CHECK_EQUAL(
+        chainstate.GetCoinsCacheSizeState(MAX_COINS_CACHE_BYTES, /*max_mempool_size_bytes=*/0),
+        CoinsCacheSizeState::LARGE);
+    const int64_t ibd_usage_at_large = view.DynamicMemoryUsage();
+    BOOST_CHECK_LT(ibd_usage_at_large, static_cast<int64_t>(MAX_COINS_CACHE_BYTES * 9 / 10));
+
+    static_cast<TestChainstateManager&>(chainman).JumpOutOfIbd();
+    BOOST_CHECK(!chainman.IsInitialBlockDownload());
+    BOOST_CHECK_EQUAL(
+        chainstate.GetCoinsCacheSizeState(MAX_COINS_CACHE_BYTES, /*max_mempool_size_bytes=*/0),
+        CoinsCacheSizeState::OK);
+
+    add_coins_until(CoinsCacheSizeState::LARGE);
+    BOOST_CHECK_EQUAL(
+        chainstate.GetCoinsCacheSizeState(MAX_COINS_CACHE_BYTES, /*max_mempool_size_bytes=*/0),
+        CoinsCacheSizeState::LARGE);
+    const int64_t synced_usage_at_large = view.DynamicMemoryUsage();
+    BOOST_CHECK_GT(synced_usage_at_large, ibd_usage_at_large);
+}
+
+//! -flushutxo-ibd-mib overrides the IBD absolute flush cap.
+BOOST_FIXTURE_TEST_CASE(ibd_flush_threshold_custom_mib, TestChain100Setup)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    auto& chainstate = chainman.ActiveChainstate();
+    const_cast<ChainstateManager::Options&>(chainman.m_options).flushutxo_ibd_mib = 8;
+
+    constexpr size_t MAX_COINS_CACHE_BYTES = 100 * 1024 * 1024;
+
+    LOCK(::cs_main);
+    auto& view = chainstate.CoinsTip();
+
+    chainman.m_cached_finished_ibd.store(false, std::memory_order_relaxed);
+    BOOST_CHECK(chainman.IsInitialBlockDownload());
+
+    while (chainstate.GetCoinsCacheSizeState(MAX_COINS_CACHE_BYTES, /*max_mempool_size_bytes=*/0) !=
+           CoinsCacheSizeState::LARGE) {
+        AddTestCoin(m_rng, view);
+    }
+
+    const int64_t usage_at_large = view.DynamicMemoryUsage();
+    // min(8 MiB, 15% of 100 MiB) = 8 MiB
+    BOOST_CHECK_GE(usage_at_large, 8 * 1024 * 1024);
+    BOOST_CHECK_LT(usage_at_large, 15 * 1024 * 1024);
+}
+
+//! IBD LARGE threshold triggers FlushStateToDisk(PERIODIC) via fCacheLarge (end-to-end).
+BOOST_FIXTURE_TEST_CASE(ibd_periodic_flush_at_large_threshold, TestChain100Setup)
+{
+    struct TestSubscriber final : CValidationInterface {
+        bool m_did_flush{false};
+        void ChainStateFlushed(ChainstateRole, const CBlockLocator&) override { m_did_flush = true; }
+    };
+
+    auto& chainman = *Assert(m_node.chainman);
+    auto& chainstate = chainman.ActiveChainstate();
+    constexpr size_t MAX_COINS_CACHE_BYTES = 100 * 1024 * 1024;
+
+    LOCK(::cs_main);
+    BOOST_REQUIRE(chainstate.ResizeCoinsCaches(MAX_COINS_CACHE_BYTES, chainstate.m_coinsdb_cache_size_bytes));
+    auto& view = chainstate.CoinsTip();
+    chainman.m_cached_finished_ibd.store(false, std::memory_order_relaxed);
+
+    // Use production GetCoinsCacheSizeState() (includes mempool slack) — same path as FlushStateToDisk.
+    while (chainstate.GetCoinsCacheSizeState() < CoinsCacheSizeState::LARGE) {
+        AddTestCoin(m_rng, view);
+    }
+    BOOST_REQUIRE_EQUAL(chainstate.GetCoinsCacheSizeState(), CoinsCacheSizeState::LARGE);
+
+    const auto sub{std::make_shared<TestSubscriber>()};
+    m_node.validation_signals->RegisterSharedValidationInterface(sub);
+    BlockValidationState state_dummy{};
+    chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(sub->m_did_flush);
+
+    sub->m_did_flush = false;
+    static_cast<TestChainstateManager&>(chainman).JumpOutOfIbd();
+    BOOST_CHECK_EQUAL(chainstate.GetCoinsCacheSizeState(), CoinsCacheSizeState::OK);
+    chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(!sub->m_did_flush);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -21,6 +21,12 @@ static constexpr bool DEFAULT_BLOCK_ZSTD{true};
 static constexpr int DEFAULT_BLOCK_ZSTD_LEVEL{20};
 static constexpr bool DEFAULT_BLOCK_ZSTD_DECOMPRESS{true};
 
+//! -blockdecompresspar default (0 = auto from -par, 1 = serial decompress only).
+static constexpr int DEFAULT_BLOCK_DECOMPRESS_PAR{0};
+static constexpr int MAX_BLOCK_DECOMPRESS_PAR{8};
+//! Minimum on-disk payload size before parallel zstd decompression is used.
+static constexpr size_t BLOCK_DECOMPRESS_PARALLEL_MIN_SIZE{32 << 10};
+
 /**
  * An options struct for `BlockManager`, more ergonomically referred to as
  * `BlockManager::Options` due to the using-declaration in `BlockManager`.
@@ -38,6 +44,8 @@ struct BlockManagerOpts {
     int block_zstd_level{DEFAULT_BLOCK_ZSTD_LEVEL};
     bool block_zstd_decompress{DEFAULT_BLOCK_ZSTD_DECOMPRESS};
     fs::path block_zstd_dict{};
+    //! Parallel block zstd decompress worker threads (0 = serial; >0 from -blockdecompresspar).
+    int block_decompress_workers{0};
 };
 
 } // namespace kernel

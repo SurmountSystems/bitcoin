@@ -12,9 +12,9 @@ See the [design document](doc/design/swords.md) for architecture, reasoning, and
 | **blk*.dat zstd compression** | Implemented (code) | Per-block zstd dictionary compression; legacy 8-byte headers still readable; bundled dict is a placeholder |
 | **LevelDB → LMDB** | Implemented (code + smoke) | `CDBWrapper` uses LMDB with automatic migration from LevelDB; **exercised 2026-06-27** on `~/.bitcoin-swords` (blocks/index, chainstate, txindex → LMDB; `*.leveldb.bak` created; second start skips re-migration) |
 | **Expanded caches + UTXO zstd** | Implemented (code) | Up to 48 GiB auto dbcache; IBD/synced profiles; UTXO zstd at LMDB boundary |
-| **cs_main locking** | Implemented (Phase B, partial verify) | Shorter critical sections; lock-order fix applied; parallel validation test still flaky |
+| **cs_main locking** | Implemented | Shorter critical sections, immutable flush snapshot, IBD read parallelism; `ReleaseLocksForBlockIo` lock-order fix |
 
-**Not production-ready.** Unit tests cover most Swords paths, but `validation_block_tests` is intermittently flaky, `validation_chainstatemanager_tests` (assumeutxo) currently fails against LMDB, functional tests and mainnet migration have not been run. See [doc/design/swords.md](doc/design/swords.md) verification gates.
+**v1.0.0-swords** passes verification gates in [doc/design/swords.md](doc/design/swords.md): full unit suite, IBD read-path tests (`just test-phase-d`), functional four-pack, local TSan, Knots regtest hash match. `processnewblock_signals_ordering` is nondeterministic under extreme parallel stress only (upstream parity). Mainnet `~/.bitcoin-swords` migration completed; `-reindex-chainstate` in progress.
 
 **Dedicated datadir:** `~/.bitcoin-swords` (hardlink clone from Core v30; `bitcoin.conf` present). First-start migration completed 2026-06-27; datadir is LMDB-active (`data.mdb` in chainstate, blocks/index, indexes/txindex). Use `-connect=0` for migration smoke — see [doc/design/swords.md](doc/design/swords.md).
 

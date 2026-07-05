@@ -90,6 +90,11 @@ public:
 struct CCoinsCacheEntry;
 using CoinsCachePair = std::pair<const COutPoint, CCoinsCacheEntry>;
 
+struct PrefetchedCoin {
+    COutPoint outpoint;
+    Coin coin;
+};
+
 /**
  * A Coin in one level of the coins database caching hierarchy.
  *
@@ -280,20 +285,29 @@ struct CoinsViewCacheCursor
     inline CoinsCachePair* Begin() const noexcept { return m_sentinel.second.Next(); }
     inline CoinsCachePair* End() const noexcept { return &m_sentinel; }
 
+    //! True when cache mutations must wait until after a successful BatchWrite (Sync path).
+    inline bool DeferCacheFinalization() const noexcept { return !m_will_erase; }
+
+    //! Advance without mutating the cache (used while BatchWrite is in progress).
+    inline CoinsCachePair* Next(CoinsCachePair& current) const noexcept { return current.second.Next(); }
+
+    //! Apply post-write cache cleanup for one entry (Sync path only).
+    inline void FinalizeEntry(CoinsCachePair& current) noexcept
+    {
+        if (m_will_erase) return;
+        if (current.second.coin.IsSpent()) {
+            m_usage -= current.second.coin.DynamicMemoryUsage();
+            m_map.erase(current.first);
+        } else {
+            current.second.SetClean();
+        }
+    }
+
     //! Return the next entry after current, possibly erasing current
     inline CoinsCachePair* NextAndMaybeErase(CoinsCachePair& current) noexcept
     {
         const auto next_entry{current.second.Next()};
-        // If we are not going to erase the cache, we must still erase spent entries.
-        // Otherwise, clear the state of the entry.
-        if (!m_will_erase) {
-            if (current.second.coin.IsSpent()) {
-                m_usage -= current.second.coin.DynamicMemoryUsage();
-                m_map.erase(current.first);
-            } else {
-                current.second.SetClean();
-            }
-        }
+        FinalizeEntry(current);
         return next_entry;
     }
 
@@ -303,6 +317,25 @@ private:
     CoinsCachePair& m_sentinel;
     CCoinsMap& m_map;
     bool m_will_erase;
+};
+
+/** One dirty UTXO entry captured for an out-of-lock LMDB flush snapshot. */
+struct CoinsFlushSnapshotEntry {
+    COutPoint outpoint;
+    bool spent{false};
+    Coin coin;
+};
+
+/**
+ * Immutable snapshot of dirty UTXO flush work collected under cs_main.
+ * Used to encode and write to LMDB without holding the live cache cursor.
+ */
+struct CoinsFlushSnapshot {
+    uint256 hashBlock;
+    bool will_erase{false};
+    //! Number of DIRTY flagged entries at snapshot time (stale-detection).
+    size_t dirty_count{0};
+    std::vector<CoinsFlushSnapshotEntry> entries;
 };
 
 /** Abstract view on the open txout dataset. */
@@ -404,6 +437,12 @@ public:
     bool HaveCoinInCache(const COutPoint &outpoint) const;
 
     /**
+     * Insert prefetched coins from parallel LMDB reads (validation thread only).
+     * Entries must not already exist in the cache; skipped if present.
+     */
+    void WarmCache(std::vector<PrefetchedCoin>&& coins);
+
+    /**
      * Return a reference to Coin in the cache, or coinEmpty if not found. This is
      * more efficient than GetCoin.
      *
@@ -446,6 +485,24 @@ public:
     bool Flush();
 
     /**
+     * Capture dirty entries for an out-of-lock LMDB write. Caller must hold cs_main.
+     * @param will_erase  When true (Flush path), cache is cleared on CommitFlushSnapshot.
+     */
+    CoinsFlushSnapshot CaptureFlushSnapshot(bool will_erase) const;
+
+    /**
+     * True when the live cache still matches the snapshot (hashBlock, dirty count, entry data).
+     * Caller must hold cs_main.
+     */
+    bool ValidateFlushSnapshot(const CoinsFlushSnapshot& snapshot) const;
+
+    /**
+     * Apply post-write cache finalization after a successful BatchWriteFromSnapshot.
+     * Caller must hold cs_main; call only when ValidateFlushSnapshot returns true.
+     */
+    void CommitFlushSnapshot(const CoinsFlushSnapshot& snapshot);
+
+    /**
      * Push the modifications applied to this cache to its base while retaining
      * the contents of this cache (except for spent coins, which we erase).
      * Failure to call this method or Flush() before destruction will cause the changes
@@ -480,6 +537,8 @@ public:
     void SanityCheck() const;
 
 private:
+    size_t CountDirtyEntries() const;
+
     /**
      * @note this is marked const, but may actually append to `cacheCoins`, increasing
      * memory usage.
@@ -494,6 +553,10 @@ private:
 // TODO: pass in a boolean to limit these possible overwrites to known
 // (pre-BIP34) cases.
 void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, bool check = false);
+
+class CBlock;
+//! Collect unique prevouts in a block that are not already in the coins cache.
+std::vector<COutPoint> CollectBlockPrevouts(const CBlock& block, const CCoinsViewCache& view);
 
 //! Utility function to find any unspent output with a given txid.
 //! This function can be quite expensive because in the event of a transaction

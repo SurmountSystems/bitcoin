@@ -22,6 +22,8 @@ add_executable(test_bitcoin
   blockencodings_tests.cpp
   blockfilter_index_tests.cpp
   blockfilter_tests.cpp
+  block_decompress_parallel_tests.cpp
+  block_prefetch_queue_tests.cpp
   blockmanager_tests.cpp
   bloom_tests.cpp
   bswap_tests.cpp
@@ -32,6 +34,7 @@ add_executable(test_bitcoin
   cluster_linearize_tests.cpp
   codex32_tests.cpp
   coins_tests.cpp
+  coins_prevouts_tests.cpp
   coinscachepair_tests.cpp
   coinstatsindex_tests.cpp
   common_url_tests.cpp
@@ -122,6 +125,10 @@ add_executable(test_bitcoin
   util_trace_tests.cpp
   validation_block_tests.cpp
   validation_chainstate_tests.cpp
+  validation_segment_equivalence_tests.cpp
+  txdb_parallel_encode_tests.cpp
+  txdb_prefetch_tests.cpp
+  txdb_sync_tests.cpp
   utxo_zstd_tests.cpp
   zstd_tests.cpp
   validation_chainstatemanager_tests.cpp

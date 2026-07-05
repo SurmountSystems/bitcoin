@@ -8,11 +8,13 @@
 #include <compress/zstd.h>
 #include <kernel/blockmanager_opts.h>
 #include <node/blockstorage.h>
+#include <node/chainstatemanager_args.h>
 #include <node/database_args.h>
 #include <tinyformat.h>
 #include <util/fs.h>
 #include <util/result.h>
 #include <util/translation.h>
+#include <common/system.h>
 #include <validation.h>
 
 #include <algorithm>
@@ -77,6 +79,23 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, BlockManager::Op
     if (auto value{args.GetBoolArg("-blockzstddecompress")}) opts.block_zstd_decompress = *value;
     if (const auto dict_arg{args.GetArg("-blockzstddict")}) {
         opts.block_zstd_dict = fs::u8path(*dict_arg);
+    }
+
+    const int64_t decompress_par{args.GetIntArg("-blockdecompresspar", kernel::DEFAULT_BLOCK_DECOMPRESS_PAR)};
+    if (decompress_par < 0 || decompress_par > kernel::MAX_BLOCK_DECOMPRESS_PAR) {
+        return util::Error{strprintf(_("Invalid -blockdecompresspar value (%d), must be between 0 and %d."),
+                                     decompress_par, kernel::MAX_BLOCK_DECOMPRESS_PAR)};
+    }
+    if (decompress_par == 1) {
+        opts.block_decompress_workers = 0;
+    } else if (decompress_par >= 2) {
+        opts.block_decompress_workers = static_cast<int>(decompress_par);
+    } else if (decompress_par == 0) {
+        int64_t script_threads{args.GetIntArg("-par", DEFAULT_SCRIPTCHECK_THREADS)};
+        if (script_threads <= 0) {
+            script_threads += GetNumCores();
+        }
+        opts.block_decompress_workers = std::min<int>(kernel::MAX_BLOCK_DECOMPRESS_PAR, std::max<int64_t>(1, script_threads - 1));
     }
 
     ReadDatabaseArgs(args, opts.block_tree_db_params.options);

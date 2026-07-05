@@ -6,8 +6,11 @@
 
 #include <consensus/consensus.h>
 #include <logging.h>
+#include <primitives/block.h>
 #include <random.h>
 #include <util/trace.h>
+
+#include <unordered_set>
 
 TRACEPOINT_SEMAPHORE(utxocache, add);
 TRACEPOINT_SEMAPHORE(utxocache, spent);
@@ -116,6 +119,23 @@ void CCoinsViewCache::EmplaceCoinInternalDANGER(COutPoint&& outpoint, Coin&& coi
     if (inserted) CCoinsCacheEntry::SetDirty(*it, m_sentinel);
 }
 
+std::vector<COutPoint> CollectBlockPrevouts(const CBlock& block, const CCoinsViewCache& view)
+{
+    std::unordered_set<COutPoint, SaltedOutpointHasher> seen;
+    std::vector<COutPoint> prevouts;
+    prevouts.reserve(256);
+    for (const auto& tx : block.vtx) {
+        if (tx->IsCoinBase()) continue;
+        for (const auto& vin : tx->vin) {
+            if (view.HaveCoinInCache(vin.prevout)) continue;
+            if (seen.insert(vin.prevout).second) {
+                prevouts.push_back(vin.prevout);
+            }
+        }
+    }
+    return prevouts;
+}
+
 void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, bool check_for_overwrite) {
     bool fCoinbase = tx.IsCoinBase();
     const Txid& txid = tx.GetHash();
@@ -168,6 +188,19 @@ bool CCoinsViewCache::HaveCoin(const COutPoint &outpoint) const {
 bool CCoinsViewCache::HaveCoinInCache(const COutPoint &outpoint) const {
     CCoinsMap::const_iterator it = cacheCoins.find(outpoint);
     return (it != cacheCoins.end() && !it->second.coin.IsSpent());
+}
+
+void CCoinsViewCache::WarmCache(std::vector<PrefetchedCoin>&& coins)
+{
+    for (PrefetchedCoin& entry : coins) {
+        if (HaveCoinInCache(entry.outpoint)) continue;
+        if (entry.coin.IsSpent()) continue;
+        auto [it, inserted] = cacheCoins.try_emplace(entry.outpoint);
+        if (!inserted) continue;
+        cachedCoinsUsage += entry.coin.DynamicMemoryUsage();
+        it->second.coin = std::move(entry.coin);
+        // Unspent coin from parent: not FRESH, not DIRTY (same as FetchCoin path).
+    }
 }
 
 uint256 CCoinsViewCache::GetBestBlock() const {
@@ -269,6 +302,90 @@ bool CCoinsViewCache::Sync()
         }
     }
     return fOk;
+}
+
+namespace {
+bool CoinsEqual(const Coin& a, const Coin& b) noexcept
+{
+    return a.fCoinBase == b.fCoinBase && a.nHeight == b.nHeight && a.out == b.out;
+}
+} // namespace
+
+size_t CCoinsViewCache::CountDirtyEntries() const
+{
+    size_t count{0};
+    for (auto it{m_sentinel.second.Next()}; it != &m_sentinel; it = it->second.Next()) {
+        if (it->second.IsDirty()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+CoinsFlushSnapshot CCoinsViewCache::CaptureFlushSnapshot(bool will_erase) const
+{
+    CoinsFlushSnapshot snapshot;
+    snapshot.hashBlock = GetBestBlock();
+    snapshot.will_erase = will_erase;
+    snapshot.dirty_count = CountDirtyEntries();
+    snapshot.entries.reserve(snapshot.dirty_count);
+
+    for (auto it{m_sentinel.second.Next()}; it != &m_sentinel; it = it->second.Next()) {
+        if (!it->second.IsDirty()) {
+            continue;
+        }
+        CoinsFlushSnapshotEntry entry;
+        entry.outpoint = it->first;
+        entry.spent = it->second.coin.IsSpent();
+        if (!entry.spent) {
+            entry.coin = it->second.coin;
+        }
+        snapshot.entries.push_back(std::move(entry));
+    }
+    return snapshot;
+}
+
+bool CCoinsViewCache::ValidateFlushSnapshot(const CoinsFlushSnapshot& snapshot) const
+{
+    if (snapshot.hashBlock != GetBestBlock()) {
+        return false;
+    }
+    if (snapshot.dirty_count != CountDirtyEntries()) {
+        return false;
+    }
+    if (snapshot.entries.size() != snapshot.dirty_count) {
+        return false;
+    }
+    for (const CoinsFlushSnapshotEntry& entry : snapshot.entries) {
+        const auto it{cacheCoins.find(entry.outpoint)};
+        if (it == cacheCoins.end() || !it->second.IsDirty()) {
+            return false;
+        }
+        if (it->second.coin.IsSpent() != entry.spent) {
+            return false;
+        }
+        if (!entry.spent && !CoinsEqual(it->second.coin, entry.coin)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void CCoinsViewCache::CommitFlushSnapshot(const CoinsFlushSnapshot& snapshot)
+{
+    if (snapshot.will_erase) {
+        cacheCoins.clear();
+        ReallocateCache();
+        cachedCoinsUsage = 0;
+        return;
+    }
+
+    auto cursor{CoinsViewCacheCursor(cachedCoinsUsage, m_sentinel, cacheCoins, /*will_erase=*/false)};
+    for (const CoinsFlushSnapshotEntry& entry : snapshot.entries) {
+        const auto it{cacheCoins.find(entry.outpoint)};
+        Assume(it != cacheCoins.end());
+        cursor.FinalizeEntry(*it);
+    }
 }
 
 void CCoinsViewCache::Uncache(const COutPoint& hash)

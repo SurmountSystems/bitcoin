@@ -27,6 +27,9 @@ static constexpr auto DEFAULT_MAX_TIP_AGE{24h};
 
 namespace kernel {
 
+//! During IBD, periodic UTXO flush when dirty cache exceeds min(this MiB, 15% of coinstip+mempool slack).
+static constexpr int64_t DEFAULT_FLUSH_UTXO_IBD_MIB{4096};
+
 /**
  * An options struct for `ChainstateManager`, more ergonomically referred to as
  * `ChainstateManager::Options` due to the using-declaration in
@@ -51,6 +54,8 @@ struct ChainstateManagerOpts {
     bool shrink_cache_on_ibd_exit{false};
     Notifications& notifications;
     ValidationSignals* signals{nullptr};
+    //! IBD periodic flush threshold (MiB); see Chainstate::GetCoinsCacheSizeState.
+    int64_t flushutxo_ibd_mib{DEFAULT_FLUSH_UTXO_IBD_MIB};
     //! Number of script check worker threads. Zero means no parallel verification.
     int worker_threads_num{0};
     size_t script_execution_cache_bytes{DEFAULT_SCRIPT_EXECUTION_CACHE_BYTES};

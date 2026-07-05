@@ -20,7 +20,7 @@ Bitcoin Swords is **not a consensus fork**. All changes are local node implement
 | 1 | zstd dictionary compression for `blk*.dat` block files | **Implemented** |
 | 2 | Replace LevelDB with LMDB | **Implemented** |
 | 3 | Expanded, configurable caches with zstd-compressed UTXO storage | **Implemented** |
-| 4 | `cs_main` locking improvements | **Implemented (Phase B)** |
+| 4 | `cs_main` locking improvements | **Implemented** |
 
 ---
 
@@ -126,7 +126,19 @@ LevelDB allows only one concurrent writer and serializes writers with readers in
 | Backup | Rename old dir to `*.leveldb.bak` | Manual rollback: delete LMDB dir, rename backup back |
 | Map sizing | Derive from `-dbcache` or override with `-dbmapsize` | LMDB uses mmap; auto-grow on `MDB_MAP_FULL` |
 | Obfuscation | XOR at LMDB value layer (application-level, not native LMDB) | Same `Obfuscation` helper as chainstate; default `0x77` key on new empty DBs; migrated LevelDB keeps its stored `obfuscate_key` |
-| Sync mode | `MDB_NOSYNC` for on-disk envs | Matches prior LevelDB durability trade-off |
+| Sync mode | `MDB_NOSYNC` for steady-state; `mdb_env_sync` on final chainstate batch of `FlushStateMode::ALWAYS` | Matches prior LevelDB durability trade-off; shutdown is the durability boundary |
+
+#### Per-database XOR policy (v1)
+
+| Database | `f_obfuscate` | Notes |
+|----------|---------------|-------|
+| `chainstate/` | true | application-layer XOR; [`src/validation.cpp`](../src/validation.cpp) |
+| `blocks/index/` | true | [`src/init.cpp`](../src/init.cpp) |
+| `indexes/txindex/` | true | [`src/index/txindex.cpp`](../src/index/txindex.cpp) |
+| `indexes/blockfilter/.../db/` | false | upstream default; [`src/index/blockfilterindex.cpp`](../src/index/blockfilterindex.cpp) |
+| `indexes/coinstats/db/` | false | upstream default; [`src/index/coinstatsindex.cpp`](../src/index/coinstatsindex.cpp) |
+
+v1 documents this intentional asymmetry. User deployments using txindex only are unaffected.
 
 #### LMDB environment layout
 
@@ -149,6 +161,8 @@ Each existing database directory (`chainstate/`, `blocks/index/`, `indexes/...`)
 |--------|---------|-------------|
 | `-migrateleveldb` | `1` | Automatically migrate legacy LevelDB directories to LMDB on startup |
 | `-dbmapsize=<n>` | `0` (derive) | Explicit LMDB map size for chainstate databases, in MiB |
+| `-lmdbsync` | `0` | Sync every chainstate LMDB write (`mdb_env_sync`); paranoid/debug only |
+| `-dbbatchsize` | — | Chainstate batch size; see §3 (Cache limits) for defaults and IBD tuning |
 
 #### Code touchpoints
 
@@ -165,25 +179,50 @@ Use a dedicated datadir (e.g. `~/.bitcoin-swords`); never run migration smoke ag
 
 ```bash
 # Migrate only — no peers, no IBD during smoke
-bitcoind -datadir=$HOME/.bitcoin-swords -connect=0 -daemon=0
+# Use build/bin/bitcoind from the Swords tree, or an installed bitcoind on PATH
+build/bin/bitcoind -datadir=$HOME/.bitcoin-swords -connect=0 -daemon=0
 
 # After "Done loading", verify RPC then stop before any catch-up:
-bitcoin-cli -datadir=$HOME/.bitcoin-swords getblockchaininfo
-bitcoin-cli -datadir=$HOME/.bitcoin-swords gettxoutsetinfo   # optional; slow on large UTXO sets
-bitcoin-cli -datadir=$HOME/.bitcoin-swords stop
+build/bin/bitcoin-cli -datadir=$HOME/.bitcoin-swords getblockchaininfo
+build/bin/bitcoin-cli -datadir=$HOME/.bitcoin-swords gettxoutsetinfo   # optional; slow on large UTXO sets
+build/bin/bitcoin-cli -datadir=$HOME/.bitcoin-swords stop
 ```
 
 Confirm in `debug.log`: three `Finished LevelDB -> LMDB migration` lines, `Opened LMDB successfully` for each DB, no `MDB_MAP_FULL`. On second start, expect direct `Opening LMDB` / `Opened LMDB successfully` with **no** new `Migrating LevelDB` lines.
 
-**Do not** leave the node on the open network during migration smoke. The P0-3 run synced ~600 blocks between migration completion and `stop`; shutdown then raced with `UpdateTip`, leaving chainstate tip ahead of flushed UTXOs (recoverable with `-reindex-chainstate`, not a migration defect).
+**Do not** leave the node on the open network during migration smoke. A prior smoke run synced ~600 blocks between migration completion and `stop`; shutdown then raced with `UpdateTip`, leaving chainstate tip ahead of flushed UTXOs (recoverable with `-reindex-chainstate`, not a migration defect).
 
 #### Known operational caveats
 
 | Caveat | Notes |
 |--------|-------|
-| **Shutdown during IBD** | `MDB_NOSYNC` matches prior LevelDB durability: shutdown flush is the durability boundary. If `stop` is requested while msghand is still connecting blocks, `UpdateTip` may run after `Shutdown: In progress`, leaving tip metadata ahead of flushed coins. Avoid by using `-connect=0` during smoke, or wait for IBD to quiesce before `stop`. Recovery: `-reindex-chainstate`. |
+| **Shutdown during IBD** | Steady-state uses `MDB_NOSYNC`; the final chainstate batch of each `FlushStateMode::ALWAYS` flush calls `mdb_env_sync`. After `Interrupt()`, `m_chain` / `UpdateTip` no longer advance; in-flight `ConnectTip` checks `m_interrupt` before `view.Flush()` so `CoinsTip` is not updated either. `Shutdown()` order: drain ABC → pre-flush (`IF_NEEDED` or `PERIODIC` if cache LARGE) → `connman` stop → `ALWAYS` flush. Still prefer `-connect=0` during smoke, or wait for IBD to quiesce before `stop`. Never `kill -9` while `Flushing chainstate to disk on shutdown...` is in progress. Recovery after unclean kill: `-reindex-chainstate`. |
 | **Large txindex migration logs** | Progress logs every 1M entries (`dbwrapper_leveldb_migrate.cpp`). Older builds logged every 100k entries and could trigger `Excessive logging detected` suppression for ~1B-entry txindex (~3 min of suppressed disk logs); cosmetic only. |
-| **Shutdown flush observability** | Shutdown logs `Flushing chainstate to disk on shutdown...` before the final `FlushStateMode::ALWAYS` passes; large flushes also emit the existing `Flushing large (N GiB) UTXO set` warning. |
+| **Shutdown flush observability** | Shutdown logs `Pre-flushing chainstate to disk on shutdown interrupt...` (incremental write, no `mdb_env_sync`; durability boundary is the subsequent `ALWAYS` passes), then `Flushing chainstate to disk on shutdown...` before `FlushStateMode::ALWAYS` (final batch calls `mdb_env_sync`). Large flushes also emit the existing `Flushing large (N GiB) UTXO set` warning. With `debug=bench`, `BatchWrite` splits encode vs LMDB write timers (`encode coins for db batch`, `write coins partial/final batch to LMDB`). |
+| **Large IBD cache vs flush latency** | With `dbcache-ibd=49152` (~31 GiB coinstip + ~286 MiB unused mempool slack), periodic flush during IBD uses `min(-flushutxo-ibd-mib, 15% of coinstip+mempool slack)` (default ~4 GiB), not the synced 90% threshold — so replay triggers periodic flushes much sooner. Shutdown `FlushStateMode::ALWAYS` still flushes whatever dirty set has accumulated and can take many minutes on large caches. Prefer letting `-reindex-chainstate` run to completion over frequent stops. |
+| **Stop / lock workflow** | Use `build/bin/bitcoin-cli -datadir=$HOME/.bitcoin-swords stop` (or `bitcoin-cli` on PATH) and wait for `Shutdown: done` in `debug.log` before restarting. Do not launch a second instance if startup reports a datadir lock error — the prior process may still be flushing. |
+
+#### `-reindex-chainstate` operations
+
+Use a dedicated datadir and isolate from the open network during recovery replay (`build/bin/bitcoind` from the Swords tree, or installed `bitcoind` on PATH):
+
+```bash
+build/bin/bitcoind -datadir=$HOME/.bitcoin-swords -reindex-chainstate -connect=0
+```
+
+| Practice | Guidance |
+|----------|----------|
+| **Minimize stops** | Let the node run through replay. Each `stop` triggers a full `ALWAYS` flush of the dirty UTXO cache. Enable `debug=bench` / `debug=coindb` only in short profiling windows; comment them out for long unattended runs to reduce log volume. |
+| **Frequent-stop workflow** | When you expect repeated `stop` or Ctrl+C (debugging, profiling), temporarily lower `dbcache-ibd` (e.g. `8192`–`16384` in `bitcoin.conf`) or `-flushutxo-ibd-mib` (e.g. `1024`–`2048`) so periodic IBD flushes stay smaller → smaller shutdown flushes at the cost of slower block replay. Restore `49152` / default `4096` for an unattended run. |
+| **Verify cache after restart** | Confirm IBD profile and coinstip sizing in `debug.log`: |
+
+```bash
+grep -iE 'Cache configuration|in-memory UTXO|resized coinstip|Automatically selected cache profiles|dbcache' ~/.bitcoin-swords/debug.log | head -30
+grep -A6 'Cache configuration:' ~/.bitcoin-swords/debug.log | tail -20
+grep -i 'cache=' ~/.bitcoin-swords/debug.log | tail -5
+```
+
+Expect startup lines such as `Automatically selected cache profiles … IBD=49152 MiB (~62.5%)` (substring `IBD=49152 MiB` is sufficient) and `* Using 31584.0 MiB for in-memory UTXO set`. When explicit `dbcache-ibd` equals the auto IBD cap, rely on these coinstip split lines rather than a `Config file arg: dbcache-ibd` line. During sustained replay, `UpdateTip` `cache=` should grow toward ~30+ GiB as the coinstip fills; early replay heights may show much smaller `cache=` until the UTXO set warms the cache.
 
 #### Remaining work
 
@@ -225,6 +264,10 @@ On a 96 GiB DDR5 machine, the upstream 2 GiB auto cap leaves most RAM unused. Ke
 | `-coinsdbcache=<n>` | `0` (computed) | Override chainstate DB / LMDB reader budget |
 | `-blocktreecache=<n>` | `0` (computed) | Override block index DB cache |
 | `-reservedram=<n>` | `2048` | MiB reserved for non-dbcache usage in auto formulas |
+| `-flushutxo-ibd-mib=<n>` | `4096` | During IBD, periodic UTXO flush when dirty cache exceeds `min(<n> MiB, 15% of coinstip+mempool slack)`; `0` flushes on any dirty cache |
+| `-dbbatchsize=<n>` | `67108864` (64 MiB) | Max bytes per chainstate LMDB `WriteBatch` during `CCoinsViewDB::BatchWrite` |
+
+**`-dbbatchsize` for IBD:** On high-RAM nodes, raise to `134217728`–`268435456` (128–256 MiB) to reduce LMDB commit overhead during large flushes. Larger batches use more transient encode RAM; pair with `debug=bench` and `debug=coindb` to compare `encode coins for db batch` vs `write coins … batch to LMDB` timings and count `Writing partial batch` lines (fewer partial batches → fewer LMDB commits).
 
 **Example (96 GiB RAM, `reservedram=4096`):** IBD auto targets ~57 GiB dbcache; synced auto targets ~23 GiB. Setting explicit `dbcache-ibd=49152` and `dbcache-synced=16384` overrides the auto formulas.
 
@@ -245,8 +288,18 @@ When `IsInitialBlockDownload()` flips from `true` → `false`, `ChainstateManage
 | `-utxozstd` | `1` | Enable zstd dictionary compression for UTXO values |
 | `-utxozstdlevel=<n>` | `20` | zstd compression level (1–22) |
 | `-utxozstddict=<path>` | install-prefix `share/swords/utxo.dict` | Path to dictionary file (resolved from install prefix or source tree) |
+| `-utxoencodepar=<n>` | `0` (auto) | Parallel UTXO pre-encode workers during `CCoinsViewDB::BatchWrite` (`1` = serial only, `2`–`8` = explicit workers; requires `-utxozstd=1` and ≥256 dirty entries) |
+| `-flushsnapshot` | `1` | Snapshot dirty UTXOs under `cs_main` and release the lock during LMDB writes (`0` = legacy in-lock `Flush`/`Sync`) |
 
 Bundled `share/swords/utxo.dict` (install prefix, not datadir) is a bootstrap placeholder; a mainnet-trained dictionary is recommended for production.
+
+#### Parallel UTXO encode
+
+During `FlushStateToDisk`, dirty UTXO entries are serialized and optionally zstd-compressed before LMDB `WriteBatch` commits. When the dirty count is at least 256 and `-utxozstd=1`, `CCoinsViewDB::BatchWrite` pre-encodes coin values in a bounded worker pool (`-utxoencodepar`, default auto from `-par`, capped at 8) and then performs single-threaded LMDB writes. The on-disk format is identical to the serial path; bench timers still split encode vs LMDB (`debug=bench`). Below the threshold, with `-utxozstd=0`, or with `-utxoencodepar=1`, the serial encode path is used.
+
+#### Immutable flush snapshot
+
+`FlushStateToDiskLocked` captures a `CoinsFlushSnapshot` (best block, dirty count, entry payloads) under `cs_main`, releases the lock for `CCoinsViewDB::BatchWriteFromSnapshot` (parallel encode + LMDB writes from the immutable snapshot) while holding per-chainstate `m_coins_flush_mutex` to serialize overlapping LMDB writes, then re-acquires `cs_main` to validate the snapshot (`hashBlock`, dirty count, per-entry coin data) before `CommitFlushSnapshot` clears or unflags the live cache. If the cache mutated during out-of-lock I/O, the flush retries until validate succeeds (logging every 16 stale attempts) instead of applying a stale batch to the live cache. `FlushStateMode::ALWAYS` re-asserts `sync_final_batch` before each write attempt. Sync-path cache finalization remains deferred until after a successful durable write. `-flushsnapshot=0` restores the legacy in-lock `Flush`/`Sync` path for debugging.
 
 #### Code touchpoints
 
@@ -255,19 +308,19 @@ Bundled `share/swords/utxo.dict` (install prefix, not datadir) is a bootstrap pl
 | `src/node/dbcache.h`, `src/node/dbcache.cpp` | Limits, IBD/synced profiles |
 | `src/node/caches.cpp` | Option wiring, shrink logic |
 | `src/validation.cpp` | `ApplySyncedCacheProfile`, IBD transition hook |
-| `src/txdb.cpp` | Compress/decompress at rest |
+| `src/txdb.cpp` | Compress/decompress at rest; parallel pre-encode before LMDB writes |
 | `share/swords/utxo.dict` | Bundled bootstrap dictionary |
 
 #### Remaining work
 
 - [ ] Train production UTXO dictionary from mainnet chainstate sample.
-- [ ] Measure CPU overhead on large `FlushStateToDisk` with compression enabled.
+- [ ] Measure CPU overhead on large `FlushStateToDisk` with compression enabled (compare serial vs `-utxoencodepar` on production hardware).
 
 ---
 
 ## 4. `cs_main` locking improvements
 
-**Status: Implemented (Phase B)**
+**Status: Implemented**
 
 ### Rationale
 
@@ -275,42 +328,135 @@ Bundled `share/swords/utxo.dict` (install prefix, not datadir) is a bootstrap pl
 
 ### Design (incremental)
 
-#### Phase A — Document invariants ✅
+#### Invariants
 
 See [cs_main_invariants.md](cs_main_invariants.md) for the invariants checklist.
 
-#### Phase B — Shorten critical sections ✅
+#### Short critical sections
 
 | Opportunity | Implementation |
 |-------------|----------------|
 | `ReadBlock` / `ReadRawBlock` | `BlockReadLoc` / `UndoReadLoc` snapshot `FlatFilePos` + hash under brief `cs_main`; I/O and zstd decompress outside lock |
-| `FlushStateToDisk` | `BlockIndexWriteBatch` collected under `cs_main`; block file flush, LMDB block-index write, and prune unlink run outside lock; coins flush remains under `cs_main` (cache cursor is live state) |
+| `FlushStateToDisk` | `BlockIndexWriteBatch` collected under `cs_main`; block file flush, LMDB block-index write, and prune unlink run outside lock; UTXO flush snapshots dirty entries under `cs_main`, releases lock during encode+LMDB (`-flushsnapshot=1`, default), re-acquires to validate and finalize cache |
 | RPC `getblock` | Lookup under lock; `GetRawBlockChecked` / `GetBlockChecked` use `BlockReadLoc` and read outside lock |
 | P2P block serving | `getdata` / REST already read outside lock; cmpctblock announcements defer disk read until after the send loop releases `cs_main` |
-| Validation connect/disconnect | `ConnectTip`, `DisconnectTip`, `RollforwardBlock`, `VerifyDB` release `cs_main` during `ReadBlock` via `LEAVE_CRITICAL_SECTION` |
+| Validation connect/disconnect | `ConnectTip`, `DisconnectTip`, `RollforwardBlock`, `VerifyDB` release `cs_main` (and `mempool.cs` before `cs_main`) during block I/O via `ReleaseLocksForBlockIo` |
 
 **Code touchpoints:** `src/node/blockstorage.{h,cpp}`, `src/validation.cpp`, `src/net_processing.cpp`, `src/rpc/blockchain.cpp`, `src/init.cpp` (ZMQ).
 
-#### Phase C — Finer-grained locks (higher risk, not implemented)
+#### Finer-grained locks (deferred)
 
 Introduce sub-locks (`cs_block_index`, `cs_chainstate`) only where ordering is provably safe. Requires formal lock ordering and TSan runs.
 
-#### Phase D — IBD-specific parallelism (not implemented)
+#### IBD read parallelism
 
-- Worker pool for zstd decompression during IBD block reads.
-- Concurrent LMDB read transactions for `GetCoin` during validation when view is read-only.
-- Release `cs_main` during UTXO LMDB write batches (requires immutable flush snapshot).
+Measurement pyramid (L0 unit equivalence → L1 microbench → L2 segment replay → L3 mainnet A/B):
+
+| Layer | Gate |
+|-------|------|
+| L0 | Byte-identical decompress; `WarmCache` matches serial `FetchCoin` |
+| L1 | `just bench` / `bench_bitcoin -priority-level=high` (IBD read-path microbenches; CMake target `swords_phase_d.cpp`) |
+| L2 | `validation_segment_equivalence_tests` |
+| L3 | Same `~/.bitcoin-swords` height segment before/after; `just parse-log` |
+
+**Implementation status:**
+
+| Feature | Status |
+|---------|--------|
+| Benchstats instrumentation (`-benchstats=1`) | **Implemented** |
+| IBD read-path microbenches and baseline tooling | **Implemented** |
+| Segment equivalence and parallel decompress tests | **Implemented** |
+| `BlockDecompressPool` + `-blockdecompresspar` (DEBUG_ONLY; IBD/import gating, ≥32 KiB payloads) | **Implemented** |
+| `BlockPrefetchQueue` depth-1 prefetch in `ActivateBestChainStep` / `ConnectTip` | **Implemented** |
+| `ParallelPrefetchCoins` + `CCoinsViewCache::WarmCache` + `-coinprefetchpar` (DEBUG_ONLY; ≥64 uncached prevouts) | **Implemented** |
+| Parallel UTXO pre-encode (`-utxoencodepar`) | **Implemented** (see §3) |
+| Immutable flush snapshot (`-flushsnapshot=1`) | **Implemented** (see §3) |
+| Ordered `LoadExternalBlockFile` decompress queue | **Deferred** |
+| Promote DEBUG_ONLY flags after mainnet A/B validation | **Deferred** |
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `-benchstats=1` | 0 | IBD read-path atomic counters (DEBUG_ONLY) |
+| `-blockdecompresspar=<n>` | 0 (auto) | Parallel block zstd decompress workers (DEBUG_ONLY) |
+| `-coinprefetchpar=<n>` | 0 (auto) | Parallel LMDB coin prefetch workers (DEBUG_ONLY) |
+
+Tooling: `just baseline`, `just baseline-compare`, `just parse-log`, `just test-phase-d` (IBD read-path unit tests; recipe name is historical).
 
 #### Verification gates
 
-- [x] Unit tests: `blockmanager_tests`, `blockchain_tests`, `cs_main_locking_tests`, `caches_tests`, `utxo_zstd_tests`, `zstd_tests`, `dbwrapper_tests`
-- [~] `validation_block_tests` — passes in isolation; `processnewblock_signals_ordering` **~90–95% pass @ 120s** post-P0-1 (was ~20%); P0-1 `cs_main`/`m_chainstate_mutex` deadlock fixed; remaining ~5–10% flake tracked separately (validation-interface ordering / test harness, not P0-1)
-- [~] `validation_chainstatemanager_tests` — assumeutxo snapshot tests require LMDB reader-slot hygiene (`mdb_reader_check` before read txns)
-- [x] First-start LevelDB → LMDB migration on a real Core datadir (`~/.bitcoin-swords`, 2026-06-27): blocks/index 921108 entries/341ms, chainstate 167830082 entries/58s, txindex 1246227219 entries/488s; `Loaded best chain` height=915951; `*.leveldb.bak` created; second start skips migration; first-start RPC `gettxoutsetinfo` `hash_serialized_3=6966e63cfaba6fef05aab3f5d260d4152a306451d8f9b4e4e27dba84f950faa4`; smoke procedure documented (`-connect=0`); post-smoke IBD/shutdown inconsistency recovered via `-reindex-chainstate`
+- [x] Unit tests: `blockmanager_tests`, `blockchain_tests`, `cs_main_locking_tests`, `caches_tests`, `utxo_zstd_tests`, `zstd_tests`, `dbwrapper_tests` — must pass
+- [x] IBD read-path unit tests: `validation_segment_equivalence_tests`, `block_decompress_parallel_tests`, `block_prefetch_queue_tests`, `txdb_prefetch_tests`, `coins_prevouts_tests` (plus overlapping `cs_main_locking_tests`, `blockmanager_tests`, `zstd_tests`) — must pass via `just test-phase-d`
+- [~] `validation_block_tests` — passes in normal runs; `processnewblock_signals_ordering` is nondeterministic under extreme parallel stress (timeout or debug `CheckBlockIndex` assert); same class as upstream; no `TestSubscriber` ordering failures observed in stress runs
+- [x] `validation_chainstatemanager_tests` — LMDB reader-slot hygiene (`mdb_reader_check` before read txns); assumeutxo cases pass
+- [x] First-start LevelDB → LMDB migration smoke on a real Core datadir (`~/.bitcoin-swords`); documented procedure with `-connect=0`; `*.leveldb.bak` created; second start skips migration
+- [x] Functional subset: `feature_assumeutxo.py`, `feature_dbcrash.py`, `feature_coinstatsindex.py`, `feature_index_prune.py`
+- [x] Local ThreadSanitizer: `cs_main_locking_tests`, `validation_chainstatemanager_tests`, `validation_block_tests`
+- [x] Knots regtest `hash_serialized_3` equivalence at height 101 with compression disabled (see procedure below)
 - [ ] `test/functional/` full suite
 - [ ] ThreadSanitizer CI job
 - [ ] Reproducible chainstate hash comparison against Knots on a fixed block range
 - [x] No change to block acceptance order or rejection reasons (local-only locking changes)
+
+#### Reproduction
+
+```bash
+# Full unit suite
+just test
+
+# IBD read-path unit tests (justfile variable phase_d_tests)
+just test-phase-d
+
+# Functional subset — stop any local Swords bitcoind first
+test/functional/test_runner.py \
+  feature_assumeutxo.py feature_dbcrash.py \
+  feature_coinstatsindex.py feature_index_prune.py
+
+# Local ThreadSanitizer (requires build-tsan tree)
+build-tsan/bin/test_bitcoin --run_test=cs_main_locking_tests
+build-tsan/bin/test_bitcoin --run_test=validation_chainstatemanager_tests
+build-tsan/bin/test_bitcoin --run_test=validation_block_tests
+
+# Optional stress repro for [~] processnewblock_signals_ordering flake
+for i in $(seq 1 20); do
+  timeout 120 build/bin/test_bitcoin \
+    --run_test=validation_block_tests/processnewblock_signals_ordering || break
+done
+```
+
+#### Knots regtest equivalence procedure
+
+Independent mining produces different blocks per node; **copy the chain** for a valid hash comparison.
+
+```bash
+# 1. Mine on Knots (reference)
+knots-bitcoind -regtest -datadir=/tmp/knots-regtest -utxozstd=0 -blockzstd=0 -daemon
+knots-cli -regtest -datadir=/tmp/knots-regtest createwallet test
+ADDR=$(knots-cli -regtest -datadir=/tmp/knots-regtest getnewaddress)
+knots-cli -regtest -datadir=/tmp/knots-regtest generatetoaddress 101 "$ADDR"
+HASH_KNOTS=$(knots-cli -regtest -datadir=/tmp/knots-regtest gettxoutsetinfo | jq -r .hash_serialized_3)
+knots-cli -regtest -datadir=/tmp/knots-regtest stop
+
+# 2. Copy identical chain to Swords datadir
+mkdir -p /tmp/swords-regtest/regtest
+cp -a /tmp/knots-regtest/regtest/{blocks,chainstate} /tmp/swords-regtest/regtest/
+
+# 3. Swords read-only load
+swords-bitcoind -regtest -datadir=/tmp/swords-regtest -utxozstd=0 -blockzstd=0 -connect=0 -daemon
+HASH_SWORDS=$(swords-cli -regtest -datadir=/tmp/swords-regtest gettxoutsetinfo | jq -r .hash_serialized_3)
+# Gate: HASH_KNOTS == HASH_SWORDS at height 101
+```
+
+Reference value at height 101 (compression disabled): `ac2d71cc68ec0f9080c837dac71fb84211fb84b44f3560c2fc89f6e2c22b8abc`.
+
+#### v1 release notes (`v1.0.0-swords`)
+
+- One-time LevelDB → LMDB migration; `*.leveldb.bak` disk footprint documented in §2.
+- Dedicated datadir recommended (`~/.bitcoin-swords`).
+- `consensusrules=rdts` (Knots BIP-110).
+- Placeholder zstd dictionaries (`share/swords/{blk,utxo}.dict`); production training deferred v1.1.
+- Network coverage: regtest `hash_serialized_3` verified vs Knots 29.x; mainnet/testnet/signet spot-checks after `~/.bitcoin-swords` `-reindex-chainstate` completes.
+- Known `[~]`: `processnewblock_signals_ordering` parallel-stress nondeterminism (upstream parity).
+- Notable fixes: `-reindex` extended-header scan; LMDB `ResizeCache` shutdown SIGSEGV; `ReleaseLocksForBlockIo` lock order; Swords fastprune wrap heights (303/608–609/2153–2160).
 
 ---
 

@@ -32,6 +32,7 @@
 #include <uint256.h>
 #include <undo.h>
 #include <util/batchpriority.h>
+#include <util/benchstats.h>
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/ioprio.h>
@@ -40,14 +41,30 @@
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/syserror.h>
+#include <util/threadnames.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 
 #include <cstddef>
+#include <mutex>
+#include <thread>
 #include <map>
 #include <optional>
 #include <ranges>
 #include <unordered_map>
+
+namespace {
+
+bool DecompressBlockPayloadImpl(const compress::BlockZstd& zstd,
+                                std::span<const uint8_t> compressed,
+                                std::vector<uint8_t>& payload,
+                                size_t max_output)
+{
+    return zstd.Decompress(compressed, payload, max_output);
+}
+
+} // namespace
 
 namespace kernel {
 static constexpr uint8_t DB_BLOCK_FILES{'f'};
@@ -1290,6 +1307,204 @@ bool BlockManager::WriteBlockUndo(const CBlockUndo& blockundo, BlockValidationSt
     return true;
 }
 
+void BlockDecompressPool::Start(int num_workers, const compress::BlockZstd* zstd)
+{
+    Stop();
+    if (num_workers < 2 || !zstd) {
+        m_num_workers = 0;
+        return;
+    }
+    m_zstd = zstd;
+    m_num_workers = num_workers;
+    m_stop.store(false, std::memory_order_relaxed);
+    m_workers.reserve(static_cast<size_t>(num_workers));
+    for (int i = 0; i < num_workers; ++i) {
+        m_workers.emplace_back([this] { WorkerLoop(); });
+    }
+}
+
+void BlockDecompressPool::Stop()
+{
+    m_stop.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard lock{m_mutex};
+        m_cv.notify_all();
+    }
+    for (std::thread& worker : m_workers) {
+        if (worker.joinable()) worker.join();
+    }
+    m_workers.clear();
+    m_num_workers = 0;
+    m_zstd = nullptr;
+    std::lock_guard lock{m_mutex};
+    m_queue.clear();
+}
+
+void BlockDecompressPool::WorkerLoop()
+{
+    util::ThreadRename("block-decompress");
+    while (!m_stop.load(std::memory_order_relaxed)) {
+        std::unique_ptr<Job> job;
+        {
+            std::unique_lock lock{m_mutex};
+            m_cv.wait(lock, [&] { return m_stop.load(std::memory_order_relaxed) || !m_queue.empty(); });
+            if (m_stop.load(std::memory_order_relaxed) && m_queue.empty()) return;
+            if (m_queue.empty()) continue;
+            job = std::move(m_queue.front());
+            m_queue.pop_front();
+        }
+        const bool ok{DecompressBlockPayloadImpl(*m_zstd, job->compressed, *job->payload, job->max_output)};
+        job->done.set_value(ok);
+    }
+}
+
+bool BlockDecompressPool::Submit(std::span<const uint8_t> compressed,
+                                 std::vector<uint8_t>& payload,
+                                 const size_t max_output) const
+{
+    if (!Active() || m_stop.load(std::memory_order_relaxed)) return false;
+    auto job{std::make_unique<Job>()};
+    job->compressed = compressed;
+    job->payload = &payload;
+    job->max_output = max_output;
+    std::future<bool> fut{job->done.get_future()};
+    {
+        std::lock_guard lock{m_mutex};
+        if (m_queue.size() >= MAX_QUEUE_DEPTH) return false;
+        m_queue.push_back(std::move(job));
+        m_cv.notify_one();
+    }
+    if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+        util::g_benchstats.block_decompress_jobs.fetch_add(1, std::memory_order_relaxed);
+    }
+    return fut.get();
+}
+
+void BlockPrefetchQueue::Invalidate()
+{
+    std::lock_guard lock{m_mutex};
+    ++m_generation;
+    m_loc = {};
+    m_payload.clear();
+    m_ready = false;
+    m_in_flight = false;
+    m_cv.notify_all();
+}
+
+void BlockPrefetchQueue::WaitForIdle()
+{
+    std::unique_lock lock{m_mutex};
+    m_cv.wait(lock, [&] { return m_active_workers.load(std::memory_order_relaxed) == 0; });
+    m_in_flight = false;
+    m_ready = false;
+}
+
+void BlockPrefetchQueue::Enqueue(const BlockReadLoc& loc, BlockManager& blockman, const util::SignalInterrupt& interrupt)
+{
+    if (!loc.IsValid()) return;
+    uint64_t generation;
+    {
+        std::lock_guard lock{m_mutex};
+        if (m_in_flight && m_loc.hash == loc.hash && m_loc.pos == loc.pos) return;
+        ++m_generation;
+        generation = m_generation;
+        m_loc = loc;
+        m_payload.clear();
+        m_ready = false;
+        m_in_flight = true;
+    }
+    m_active_workers.fetch_add(1, std::memory_order_relaxed);
+    std::thread{[&blockman, generation, loc, &interrupt, this] {
+        struct ActiveWorker {
+            BlockPrefetchQueue& queue;
+            ~ActiveWorker()
+            {
+                queue.m_active_workers.fetch_sub(1, std::memory_order_relaxed);
+                queue.m_cv.notify_all();
+            }
+        } worker{*this};
+        if (interrupt) return;
+        std::vector<uint8_t> payload;
+        if (!blockman.ReadBlockFromPayload(payload, loc, /*lowprio=*/true)) return;
+        std::lock_guard lock{m_mutex};
+        if (generation != m_generation) return;
+        m_payload = std::move(payload);
+        m_ready = true;
+        m_cv.notify_all();
+    }}.detach();
+}
+
+std::optional<std::vector<uint8_t>> BlockPrefetchQueue::TakeIfReady(const BlockReadLoc& loc)
+{
+    std::lock_guard lock{m_mutex};
+    if (!m_ready || m_loc.hash != loc.hash || m_loc.pos != loc.pos) return std::nullopt;
+    m_ready = false;
+    m_in_flight = false;
+    return std::move(m_payload);
+}
+
+void BlockManager::ConfigureDecompressPool(const int workers)
+{
+    m_decompress_workers = workers;
+    if (m_decompress_workers >= 2 && m_block_zstd) {
+        m_decompress_pool.Start(m_decompress_workers, &m_block_zstd);
+    } else {
+        m_decompress_pool.Stop();
+    }
+}
+
+bool BlockManager::ReadRawBlockFromStored(std::vector<uint8_t>& block,
+                                          const BlockDiskHeader& header,
+                                          std::span<const uint8_t> stored,
+                                          const bool allow_parallel_decompress) const
+{
+    if (BlockDiskPayloadIsCompressed(header)) {
+        const auto decompress_start{SteadyClock::now()};
+        bool ok{false};
+        const bool use_pool{allow_parallel_decompress
+                          && m_decompress_pool.Active()
+                          && stored.size() >= kernel::BLOCK_DECOMPRESS_PARALLEL_MIN_SIZE
+                          && m_opts.block_zstd_decompress
+                          && m_block_zstd
+                          && IbdParallelReadsAllowed()};
+        if (use_pool && m_decompress_pool.Submit(stored, block, MAX_BLOCK_SERIALIZED_SIZE)) {
+            ok = true;
+        } else {
+            ok = DecompressBlockPayloadImpl(m_block_zstd, stored, block, MAX_BLOCK_SERIALIZED_SIZE);
+        }
+        if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+            const auto us{Ticks<std::chrono::microseconds>(SteadyClock::now() - decompress_start)};
+            util::g_benchstats.block_decompress_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+        }
+        if (!ok) return false;
+    } else {
+        block.assign(stored.begin(), stored.end());
+    }
+    return block.size() <= MAX_BLOCK_SERIALIZED_SIZE;
+}
+
+bool BlockManager::ReadBlockFromPayload(std::vector<uint8_t>& block, const BlockReadLoc& loc, const bool lowprio) const
+{
+    if (!loc.IsValid()) return false;
+    IOPRIO_IDLER(lowprio);
+    const uint32_t probe_size{std::min(loc.pos.nPos, BLOCK_SERIALIZATION_HEADER_SIZE)};
+    AutoFile filein{OpenBlockFile({loc.pos.nFile, loc.pos.nPos - probe_size}, /*fReadOnly=*/true)};
+    if (filein.IsNull()) return false;
+    if (lowprio) filein.SetIdlePriority();
+    try {
+        std::vector<uint8_t> header_bytes(probe_size);
+        filein.read(MakeWritableByteSpan(header_bytes));
+        BlockDiskHeader header;
+        if (!ParseBlockDiskHeader(GetParams(), loc.pos.nPos, header_bytes, header)) return false;
+        if (!CompressedBlockReadAllowed(header, m_opts.block_zstd_decompress)) return false;
+        std::vector<uint8_t> stored(header.stored_size);
+        filein.read(MakeWritableByteSpan(stored));
+        return ReadRawBlockFromStored(block, header, stored, /*allow_parallel_decompress=*/true);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::optional<uint256>& expected_hash, const bool lowprio) const
 {
     block.SetNull();
@@ -1352,6 +1567,7 @@ bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& 
 
     IOPRIO_IDLER(lowprio);
 
+    const auto disk_start{SteadyClock::now()};
     const uint32_t probe_size{std::min(pos.nPos, BLOCK_SERIALIZATION_HEADER_SIZE)};
     AutoFile filein{OpenBlockFile({pos.nFile, pos.nPos - probe_size}, /*fReadOnly=*/true)};
     if (filein.IsNull()) {
@@ -1380,18 +1596,18 @@ bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& 
         stored.resize(header.stored_size);
         filein.read(MakeWritableByteSpan(stored));
 
-        if (BlockDiskPayloadIsCompressed(header)) {
-            if (!m_block_zstd.Decompress(stored, block, MAX_BLOCK_SERIALIZED_SIZE)) {
-                LogError("%s: Failed to decompress block at %s\n", __func__, pos.ToString());
-                return false;
-            }
-        } else {
-            block = std::move(stored);
+        if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+            const auto us{Ticks<std::chrono::microseconds>(SteadyClock::now() - disk_start)};
+            util::g_benchstats.block_read_disk_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
         }
 
-        if (block.size() > MAX_BLOCK_SERIALIZED_SIZE) {
-            LogError("%s: Block data is larger than maximum deserialization size for %s: %s versus %s\n", __func__,
-                     pos.ToString(), block.size(), MAX_BLOCK_SERIALIZED_SIZE);
+        if (!ReadRawBlockFromStored(block, header, stored, /*allow_parallel_decompress=*/true)) {
+            if (BlockDiskPayloadIsCompressed(header)) {
+                LogError("%s: Failed to decompress block at %s\n", __func__, pos.ToString());
+            } else if (block.size() > MAX_BLOCK_SERIALIZED_SIZE) {
+                LogError("%s: Block data is larger than maximum deserialization size for %s: %s versus %s\n", __func__,
+                         pos.ToString(), block.size(), MAX_BLOCK_SERIALIZED_SIZE);
+            }
             return false;
         }
     } catch (const std::exception& e) {
@@ -1404,7 +1620,7 @@ bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& 
 
 bool BlockManager::DecompressBlockPayload(std::span<const uint8_t> compressed, std::vector<uint8_t>& payload) const
 {
-    return m_block_zstd.Decompress(compressed, payload, MAX_BLOCK_SERIALIZED_SIZE);
+    return DecompressBlockPayloadImpl(m_block_zstd, compressed, payload, MAX_BLOCK_SERIALIZED_SIZE);
 }
 
 FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)
@@ -1559,6 +1775,8 @@ BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
         LogWarning("Block zstd decompression is enabled (-blockzstddecompress=1) but no dictionary is loaded; "
                    "compressed blocks on disk cannot be read\n");
     }
+    m_decompress_workers = m_opts.block_decompress_workers;
+    ConfigureDecompressPool(m_decompress_workers);
 }
 
 class ImportingNow

@@ -129,7 +129,10 @@ int main(int argc, char* argv[])
         .synced_cache_sizes = synced_cache_sizes.kernel,
         .shrink_cache_on_ibd_exit = node::ShouldShrinkCacheOnIbdExit(args),
     };
-    node::ReadCoinsViewArgs(args, chainman_opts.coins_view);
+    if (auto result{node::ReadCoinsViewArgs(args, chainman_opts.coins_view)}) {
+        std::cerr << util::ErrorString(result) << std::endl;
+        return EXIT_FAILURE;
+    }
     const node::BlockManager::Options blockman_opts{
         .chainparams = chainman_opts.chainparams,
         .blocks_dir = abs_datadir / "blocks",

@@ -354,7 +354,10 @@ CDBWrapper::CDBWrapper(const DBParams& params)
     HandleLMDBError(mdb_env_create(&ctx.env), "env create");
     HandleLMDBError(mdb_env_set_maxdbs(ctx.env, 1), "set maxdbs");
     HandleLMDBError(mdb_env_set_mapsize(ctx.env, ctx.map_size), "set mapsize");
-    HandleLMDBError(mdb_env_set_maxreaders(ctx.env, std::max<size_t>(64, params.cache_bytes / (2 << 20))), "set maxreaders");
+    const unsigned int max_readers{params.max_readers > 0
+        ? params.max_readers
+        : static_cast<unsigned int>(std::max<size_t>(64, params.cache_bytes / (2 << 20)))};
+    HandleLMDBError(mdb_env_set_maxreaders(ctx.env, max_readers), "set maxreaders");
 
     // MDB_NOTLS ties reader slots to txn objects instead of pthread TLS, which
     // avoids MDB_BAD_RSLOT when a thread uses multiple LMDB environments (e.g.
@@ -411,6 +414,9 @@ CDBWrapper::~CDBWrapper()
 
 bool CDBWrapper::WriteBatch(CDBBatch& batch, bool fSync)
 {
+    if (dbwrapper_private::TestWriteBatchSyncLog().active) {
+        dbwrapper_private::TestWriteBatchSyncLog().calls.push_back(fSync);
+    }
     auto& ctx = const_cast<LMDBContext&>(DBContext());
     const bool log_memory = LogDBWrapperDebug();
     const double mem_before = log_memory ? DynamicMemoryUsage() / 1024.0 / 1024 : 0;
@@ -494,6 +500,14 @@ size_t CDBWrapper::DynamicMemoryUsage() const
         LogDebug(BCLog::LEVELDB, "Failed to get LMDB environment usage\n");
     }
     return usage;
+}
+
+unsigned int CDBWrapper::GetMaxReaders() const
+{
+    const auto& ctx = DBContext();
+    unsigned int readers{0};
+    HandleLMDBError(mdb_env_get_maxreaders(ctx.env, &readers), "get maxreaders");
+    return readers;
 }
 
 const std::string CDBWrapper::OBFUSCATE_KEY_KEY("\000obfuscate_key", 14);
@@ -629,6 +643,13 @@ void CDBIterator::SeekToFirst() { m_impl_iter->SeekToFirst(); }
 void CDBIterator::Next() { m_impl_iter->Next(); }
 
 namespace dbwrapper_private {
+
+WriteBatchSyncLog g_test_write_batch_sync_log;
+
+WriteBatchSyncLog& TestWriteBatchSyncLog()
+{
+    return g_test_write_batch_sync_log;
+}
 
 const Obfuscation& GetObfuscateKey(const CDBWrapper& w)
 {
