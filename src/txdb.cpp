@@ -6,6 +6,9 @@
 #include <txdb.h>
 
 #include <coins.h>
+#include <chainparams.h>
+#include <compress/dict_bootstrap.h>
+#include <compress/dict_classify.h>
 #include <compress/zstd.h>
 #include <dbwrapper.h>
 #include <logging.h>
@@ -34,11 +37,6 @@ static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
 static constexpr uint8_t DB_COINS{'c'};
 
 namespace {
-static constexpr uint8_t COIN_VALUE_VERSION{1};
-static constexpr uint8_t COIN_VALUE_UNCOMPRESSED{0};
-static constexpr uint8_t COIN_VALUE_COMPRESSED{1};
-//! Upper bound for a single decompressed UTXO entry (generous DoS limit).
-static constexpr size_t MAX_COIN_VALUE_SIZE{1 << 20};
 
 struct CoinDBValue {
     std::vector<uint8_t> bytes;
@@ -69,20 +67,56 @@ bool TryDeserializeCoin(std::span<const uint8_t> data, Coin& coin)
     return !coin.IsSpent();
 }
 
+} // namespace
+
+static constexpr uint8_t COIN_VALUE_VERSION{1};
+static constexpr uint8_t COIN_VALUE_UNCOMPRESSED{0};
+static constexpr uint8_t COIN_VALUE_COMPRESSED{1};
+//! Upper bound for a single decompressed UTXO entry (generous DoS limit).
+static constexpr size_t MAX_COIN_VALUE_SIZE{1 << 20};
+
 bool DecodeCoinValue(std::span<const uint8_t> data, const compress::UtxoZstd& zstd, Coin& coin)
 {
-    if (TryDeserializeCoin(data, coin)) return true;
-
     if (data.size() >= 2 && data[0] == COIN_VALUE_VERSION && data[1] == COIN_VALUE_UNCOMPRESSED) {
         return TryDeserializeCoin(data.subspan(2), coin);
     }
 
     if (data.size() >= 2 && data[0] == COIN_VALUE_VERSION && data[1] == COIN_VALUE_COMPRESSED) {
-        if (!zstd) return false;
+        if (!zstd) return TryDeserializeCoin(data, coin);
         std::vector<uint8_t> decompressed;
-        if (!zstd.Decompress(data.subspan(2), decompressed, MAX_COIN_VALUE_SIZE)) return false;
+        if (!zstd.Decompress(data.subspan(2), decompressed, MAX_COIN_VALUE_SIZE)) {
+            // Legacy serialized coins can begin with 0x01 0x01 (version + compressed marker).
+            return TryDeserializeCoin(data, coin);
+        }
         return TryDeserializeCoin(decompressed, coin);
     }
+
+    if (data.size() >= 2 && data[0] == COIN_VALUE_VERSION && (data[1] & compress::COIN_VALUE_TYPED_BUCKET) != 0) {
+        const auto payload{data.subspan(2)};
+        const uint8_t bucket_id{static_cast<uint8_t>(data[1] & ~compress::COIN_VALUE_TYPED_BUCKET)};
+        const compress::DictZstd* dict{&zstd};
+        if (compress::g_dict_bootstrap && compress::g_dict_bootstrap->UseTypedUtxoFormat()
+            && bucket_id < compress::NUM_UTXO_BUCKETS) {
+            const compress::DictZstd& typed{
+                compress::g_dict_bootstrap->UtxoDict(static_cast<compress::UtxoBucket>(bucket_id))};
+            if (typed) {
+                dict = &typed;
+            } else if (bucket_id != 0) {
+                LogPrintf("Warning: missing typed UTXO dictionary for bucket %s; falling back to monolithic dictionary\n",
+                          compress::UtxoBucketName(static_cast<compress::UtxoBucket>(bucket_id)));
+            }
+        }
+        if (!*dict) {
+            return TryDeserializeCoin(payload, coin);
+        }
+        std::vector<uint8_t> decompressed;
+        if (dict->Decompress(payload, decompressed, MAX_COIN_VALUE_SIZE)) {
+            return TryDeserializeCoin(decompressed, coin);
+        }
+        return TryDeserializeCoin(payload, coin);
+    }
+
+    if (TryDeserializeCoin(data, coin)) return true;
 
     return false;
 }
@@ -97,7 +131,58 @@ std::vector<uint8_t> SerializeCoin(const Coin& coin)
 std::vector<uint8_t> EncodeCoinValue(const Coin& coin, const CoinsViewOptions& options, const compress::UtxoZstd& zstd)
 {
     const std::vector<uint8_t> serialized{SerializeCoin(coin)};
-    if (!options.utxo_zstd || !zstd) {
+    if (compress::g_dict_bootstrap && compress::g_dict_bootstrap->UseTypedUtxoFormat()) {
+        const compress::UtxoBucket bucket{compress::ClassifyCoin(coin, Params())};
+        if (compress::g_dict_bootstrap->IsPass1InProgress()) {
+            compress::g_dict_bootstrap->OnCoinEncoded(coin, serialized);
+            std::vector<uint8_t> stored;
+            stored.reserve(2 + serialized.size());
+            stored.push_back(COIN_VALUE_VERSION);
+            stored.push_back(compress::g_dict_bootstrap->UtxoTypeByteForBucket(bucket));
+            stored.insert(stored.end(), serialized.begin(), serialized.end());
+            return stored;
+        }
+        if (compress::g_dict_bootstrap->ShouldCompressOnWrite()) {
+            const compress::DictZstd& dict{compress::g_dict_bootstrap->UtxoDict(bucket)};
+            std::vector<uint8_t> compressed;
+            if (dict.Compress(serialized, compressed, options.utxo_zstd_level)) {
+                const size_t stored_size{2 + compressed.size()};
+                if (stored_size < serialized.size()) {
+                    std::vector<uint8_t> stored;
+                    stored.reserve(stored_size);
+                    stored.push_back(COIN_VALUE_VERSION);
+                    stored.push_back(compress::g_dict_bootstrap->UtxoTypeByteForBucket(bucket));
+                    stored.insert(stored.end(), compressed.begin(), compressed.end());
+                    compress::g_dict_bootstrap->OnCoinStored(bucket, serialized.size(), stored.size());
+                    return stored;
+                }
+            } else if (!dict && zstd.Compress(serialized, compressed, options.utxo_zstd_level)) {
+                const size_t stored_size{2 + compressed.size()};
+                if (stored_size < serialized.size()) {
+                    LogPrintf("Warning: missing typed UTXO dictionary for bucket %s; falling back to monolithic dictionary\n",
+                              compress::UtxoBucketName(bucket));
+                    std::vector<uint8_t> stored;
+                    stored.reserve(stored_size);
+                    stored.push_back(COIN_VALUE_VERSION);
+                    stored.push_back(COIN_VALUE_COMPRESSED);
+                    stored.insert(stored.end(), compressed.begin(), compressed.end());
+                    compress::g_dict_bootstrap->OnCoinStored(bucket, serialized.size(), stored.size());
+                    return stored;
+                }
+            } else if (!dict) {
+                LogPrintf("Warning: missing typed UTXO dictionary for bucket %s; writing uncompressed payload\n",
+                          compress::UtxoBucketName(bucket));
+            }
+            std::vector<uint8_t> stored;
+            stored.reserve(2 + serialized.size());
+            stored.push_back(COIN_VALUE_VERSION);
+            stored.push_back(compress::g_dict_bootstrap->UtxoTypeByteForBucket(bucket));
+            stored.insert(stored.end(), serialized.begin(), serialized.end());
+            compress::g_dict_bootstrap->OnCoinStored(bucket, serialized.size(), stored.size());
+            return stored;
+        }
+    }
+    if (!options.utxo_zstd || !zstd || (compress::g_dict_bootstrap && !compress::g_dict_bootstrap->ShouldCompressOnWrite())) {
         return serialized;
     }
 
@@ -120,6 +205,8 @@ std::vector<uint8_t> EncodeCoinValue(const Coin& coin, const CoinsViewOptions& o
     stored.insert(stored.end(), compressed.begin(), compressed.end());
     return stored;
 }
+
+namespace {
 
 struct CoinEntry {
     COutPoint* outpoint;

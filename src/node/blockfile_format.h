@@ -26,6 +26,16 @@ static constexpr uint32_t BLOCK_SERIALIZATION_HEADER_SIZE{std::tuple_size_v<Mess
 /** Bit 0 of the per-block flags byte: payload is zstd-compressed. */
 static constexpr uint8_t BLOCK_SERIALIZATION_FLAG_COMPRESSED{0x01};
 
+/** Bits 1-4 of the per-block flags byte: typed dictionary bucket id (0-15). */
+static constexpr uint8_t BLOCK_SERIALIZATION_FLAG_BUCKET_SHIFT{1};
+static constexpr uint8_t BLOCK_SERIALIZATION_FLAG_BUCKET_MASK{0x1E};
+
+/** Encode a typed block bucket id into the per-block flags byte. */
+constexpr uint8_t BlockBucketFlags(uint8_t bucket_id) { return static_cast<uint8_t>(bucket_id << BLOCK_SERIALIZATION_FLAG_BUCKET_SHIFT); }
+
+/** Extract the typed block bucket id from the per-block flags byte. */
+constexpr uint8_t BlockBucketFromFlags(uint8_t flags) { return static_cast<uint8_t>((flags & BLOCK_SERIALIZATION_FLAG_BUCKET_MASK) >> BLOCK_SERIALIZATION_FLAG_BUCKET_SHIFT); }
+
 /** Parsed per-block disk header preceding the payload in blk*.dat files. */
 struct BlockDiskHeader
 {
@@ -35,8 +45,11 @@ struct BlockDiskHeader
     bool legacy_format{false};
 };
 
-/** Return true when @p flags uses only the known compressed bit. */
-constexpr bool ValidBlockDiskFlags(uint8_t flags) { return (flags & ~BLOCK_SERIALIZATION_FLAG_COMPRESSED) == 0; }
+/** Return true when @p flags uses only known compressed and bucket-id bits. */
+constexpr bool ValidBlockDiskFlags(uint8_t flags)
+{
+    return (flags & ~(BLOCK_SERIALIZATION_FLAG_COMPRESSED | BLOCK_SERIALIZATION_FLAG_BUCKET_MASK)) == 0;
+}
 
 /** Returns true when @p header indicates a zstd-compressed on-disk payload. */
 constexpr bool BlockDiskPayloadIsCompressed(const BlockDiskHeader& header)

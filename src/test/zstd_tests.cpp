@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <compress/dict_bootstrap.h>
 #include <compress/zstd.h>
 #include <index/disktxpos.h>
 #include <logging.h>
@@ -154,7 +155,7 @@ BOOST_AUTO_TEST_CASE(blockfile_format_legacy_and_extended)
     BOOST_CHECK_EQUAL(header.header_size, BLOCK_SERIALIZATION_HEADER_SIZE);
     BOOST_CHECK_EQUAL(payload_offset, BLOCK_SERIALIZATION_HEADER_SIZE);
 
-    BOOST_CHECK(!ValidBlockDiskFlags(0x02));
+    BOOST_CHECK(ValidBlockDiskFlags(0x02));
     BOOST_CHECK(ValidBlockDiskFlags(0x00));
     BOOST_CHECK(ValidBlockDiskFlags(0x01));
 
@@ -163,7 +164,7 @@ BOOST_AUTO_TEST_CASE(blockfile_format_legacy_and_extended)
     extended_prefix[1] = magic[1];
     extended_prefix[2] = magic[2];
     extended_prefix[3] = magic[3];
-    extended_prefix[4] = 0x02; // reserved flag bit
+    extended_prefix[4] = 0x20; // unknown flag bit
     extended_prefix[5] = 0x50;
     extended_prefix[6] = 0x00;
     extended_prefix[7] = 0x00;
@@ -368,6 +369,104 @@ BOOST_FIXTURE_TEST_CASE(blockmanager_missing_dictionary_startup_warnings, LogSet
     }
     BOOST_CHECK(saw_compress_warning);
     BOOST_CHECK(saw_decompress_warning);
+}
+
+namespace {
+
+void SetupTypedBlockDictForTest(const fs::path& datadir)
+{
+    const fs::path samples_dir{datadir / "swords" / "samples"};
+    const fs::path dicts_dir{datadir / "swords" / "dicts"};
+    fs::create_directories(samples_dir);
+    fs::create_directories(dicts_dir);
+    compress::DictSampleCollector collector{samples_dir};
+    const std::vector<uint8_t> sample(512, 0x3a);
+    for (int i = 0; i < 8; ++i) {
+        collector.CollectBlockSample(compress::BlockBucket::BLK_P2TR_POST_ORD, sample);
+    }
+    compress::DictionaryTrainer trainer{dicts_dir, collector, 767430};
+    trainer.TrainAllBuckets(/*final_train=*/true);
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(legacy_mono_compressed_block_readable_with_typed_bootstrap)
+{
+    const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    const fs::path datadir{m_args.GetDataDirBase() / "legacy_mono_with_typed"};
+    fs::remove_all(datadir);
+    SetupTypedBlockDictForTest(datadir);
+
+    KernelNotifications notifications{Assert(m_node.shutdown_request), m_node.exit_status, *Assert(m_node.warnings)};
+    const BlockManager::Options write_opts{
+        .chainparams = *params,
+        .blocks_dir = m_args.GetBlocksDirPath(),
+        .notifications = notifications,
+        .block_tree_db_params = DBParams{
+            .path = m_args.GetDataDirNet() / "blocks" / "index",
+            .cache_bytes = 0,
+        },
+        .block_zstd = true,
+    };
+
+    FlatFilePos pos;
+    {
+        BlockManager writer{*Assert(m_node.shutdown_signal), write_opts};
+        const CBlock block{MakeRepetitiveBlock()};
+        pos = writer.WriteBlock(block, 1);
+    }
+
+    ArgsManager local_args;
+    local_args.ForceSetArg("-dictbootstrap", "auto");
+    fs::create_directories(datadir / "swords");
+    std::ofstream{datadir / "swords" / "bootstrap_state.json"} << "{\"state\": \"complete\"}\n";
+    compress::g_dict_bootstrap = std::make_unique<compress::DictBootstrapManager>(datadir, *params, local_args);
+
+    BlockManager::Options read_opts{write_opts};
+    read_opts.block_zstd_decompress = true;
+    BlockManager reader{*Assert(m_node.shutdown_signal), read_opts};
+    std::vector<uint8_t> raw;
+    BOOST_CHECK(reader.ReadRawBlock(raw, pos));
+    compress::g_dict_bootstrap.reset();
+}
+
+BOOST_AUTO_TEST_CASE(dict_set_load_from_manifest)
+{
+    const fs::path manifest_path{compress::DefaultDictManifestPath()};
+    if (!fs::exists(manifest_path)) {
+        BOOST_WARN_MESSAGE(false, "bundled dict manifest not available; skipping DictSet load test");
+        return;
+    }
+    compress::DictSet dicts;
+    BOOST_CHECK(dicts.Load(m_args.GetDataDirBase()));
+    BOOST_CHECK(!dicts.ManifestEntries().empty());
+}
+
+BOOST_AUTO_TEST_CASE(load_dictionary_size_limits)
+{
+    const fs::path dict_dir{m_args.GetDataDirBase() / "dict_size_tests"};
+    fs::create_directories(dict_dir);
+
+    {
+        std::vector<uint8_t> dict(2 * 1024 * 1024, 0xab);
+        const fs::path path{dict_dir / "two_mib.dict"};
+        std::ofstream out{path, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(dict.data()), static_cast<std::streamsize>(dict.size()));
+        BOOST_REQUIRE(out.good());
+        const auto loaded{compress::LoadDictionaryFile(path)};
+        BOOST_REQUIRE(loaded);
+        BOOST_CHECK_EQUAL(loaded->size(), dict.size());
+    }
+
+    {
+        std::vector<uint8_t> dict(5 * 1024 * 1024, 0xcd);
+        const fs::path path{dict_dir / "five_mib.dict"};
+        std::ofstream out{path, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(dict.data()), static_cast<std::streamsize>(dict.size()));
+        BOOST_REQUIRE(out.good());
+        const auto loaded{compress::LoadDictionaryFile(path)};
+        BOOST_CHECK(!loaded);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

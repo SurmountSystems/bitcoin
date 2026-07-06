@@ -54,9 +54,12 @@ test: build-tests
 test-one case: build-tests
     {{test_bitcoin}} --run_test={{case}}
 
-[doc("Start reindex-chainstate (isolated from P2P)")]
-reindex: build-daemon
-    {{bitcoind}} -datadir={{datadir}} -reindex-chainstate -connect=0
+[doc("Reindex chainstate only, foreground (isolated from P2P)")]
+reindex-chainstate: build-daemon
+    {{bitcoind}} -datadir={{datadir}} -reindex-chainstate -connect=0 -printtoconsole
+
+# Back-compat alias
+alias reindex := reindex-chainstate
 
 [doc("Stop the node")]
 stop:
@@ -102,3 +105,59 @@ parse-log DATADIR=datadir:
 [doc("IBD read-path unit tests (equivalence + decompress + locking); recipe name test-phase-d is historical")]
 test-phase-d: build-tests
     {{test_bitcoin}} --run_test={{phase_d_tests}}
+
+[doc("Dictionary bootstrap unit tests")]
+test-bootstrap: build-tests
+    {{test_bitcoin}} --run_test=dict_bootstrap_tests
+
+[doc("Parse-reindex-log.py unit tests")]
+test-parse-log:
+    python3 {{root}}/contrib/swords/test_parse_reindex_log.py -v
+
+[doc("Functional 4-pack (assumeutxo, dbcrash, coinstatsindex, index_prune)")]
+test-functional:
+    {{root}}/test/functional/test_runner.py --combinedlogslen=4000 \
+        feature_assumeutxo.py feature_dbcrash.py \
+        feature_coinstatsindex.py feature_index_prune.py
+
+[doc("Swords verification gates: unit + bootstrap + phase-d + parser + functional")]
+verify: build test-bootstrap test-phase-d test-parse-log test-functional
+
+[doc("Wipe chain data; keeps bitcoin.conf (SWORDS_DATADIR, default ~/.bitcoin-swords)")]
+reset-datadir: build-cli
+    #!/usr/bin/env bash
+    set -euo pipefail
+    datadir="{{datadir}}"
+    if [[ ! -d "$datadir" ]]; then
+        echo "Creating $datadir"
+        mkdir -p "$datadir"
+        exit 0
+    fi
+    echo "Stopping node on $datadir (if running)..."
+    "{{bitcoin_cli}}" -datadir="$datadir" stop 2>/dev/null || true
+    sleep 2
+    echo "Resetting chain data under $datadir (preserving bitcoin.conf)..."
+    rm -rf \
+        "$datadir/blocks" \
+        "$datadir/chainstate" \
+        "$datadir/indexes" \
+        "$datadir/swords" \
+        "$datadir/chainstate.leveldb.bak" \
+        "$datadir/blocks.leveldb.bak" \
+        "$datadir/debug.log" \
+        "$datadir/peers.dat" \
+        "$datadir/mempool.dat" \
+        "$datadir/fee_estimates.dat" \
+        "$datadir/banlist.json" \
+        "$datadir/anchors.dat" \
+        "$datadir/settings.json" \
+        "$datadir/.lock"
+    echo "Done. $datadir is ready for a fresh mainnet IBD."
+
+[doc("Mainnet node in foreground (pass 1 IBD when no bootstrap state exists)")]
+start: build-daemon
+    {{bitcoind}} -datadir={{datadir}} -printtoconsole
+
+[doc("Pass 2: full -reindex in foreground (compress blocks/UTXO with typed dicts)")]
+pass2: build-daemon
+    {{bitcoind}} -datadir={{datadir}} -reindex -dictbootstrap=auto -connect=0 -printtoconsole

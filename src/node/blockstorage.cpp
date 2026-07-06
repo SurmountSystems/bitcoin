@@ -4,6 +4,8 @@
 
 #include <node/blockstorage.h>
 
+#include <compress/dict_bootstrap.h>
+#include <compress/dict_classify.h>
 #include <compress/zstd.h>
 #include <node/blockfile_format.h>
 #include <arith_uint256.h>
@@ -62,6 +64,24 @@ bool DecompressBlockPayloadImpl(const compress::BlockZstd& zstd,
                                 size_t max_output)
 {
     return zstd.Decompress(compressed, payload, max_output);
+}
+
+const compress::BlockZstd& BlockDictForDecompress(const uint8_t flags,
+                                                  const compress::BlockZstd& fallback)
+{
+    if ((flags & node::BLOCK_SERIALIZATION_FLAG_BUCKET_MASK) == 0) {
+        return fallback;
+    }
+    const uint8_t bucket_id{node::BlockBucketFromFlags(flags)};
+    if (compress::g_dict_bootstrap && compress::g_dict_bootstrap->UseTypedBlockFormat()
+        && bucket_id < compress::NUM_BLOCK_BUCKETS) {
+        const compress::DictZstd& typed{
+            compress::g_dict_bootstrap->BlockDict(static_cast<compress::BlockBucket>(bucket_id))};
+        if (typed) return typed;
+        LogPrintf("Warning: missing typed block dictionary for bucket %s; falling back to monolithic dictionary\n",
+                  compress::BlockBucketName(static_cast<compress::BlockBucket>(bucket_id)));
+    }
+    return fallback;
 }
 
 } // namespace
@@ -1461,16 +1481,19 @@ bool BlockManager::ReadRawBlockFromStored(std::vector<uint8_t>& block,
     if (BlockDiskPayloadIsCompressed(header)) {
         const auto decompress_start{SteadyClock::now()};
         bool ok{false};
+        const compress::BlockZstd& zstd{BlockDictForDecompress(header.flags, m_block_zstd)};
+        // Typed-bucket decompression uses per-bucket dicts inline; parallel pool is mono-dict only.
         const bool use_pool{allow_parallel_decompress
                           && m_decompress_pool.Active()
                           && stored.size() >= kernel::BLOCK_DECOMPRESS_PARALLEL_MIN_SIZE
                           && m_opts.block_zstd_decompress
-                          && m_block_zstd
+                          && zstd
+                          && (header.flags & BLOCK_SERIALIZATION_FLAG_BUCKET_MASK) == 0
                           && IbdParallelReadsAllowed()};
         if (use_pool && m_decompress_pool.Submit(stored, block, MAX_BLOCK_SERIALIZED_SIZE)) {
             ok = true;
         } else {
-            ok = DecompressBlockPayloadImpl(m_block_zstd, stored, block, MAX_BLOCK_SERIALIZED_SIZE);
+            ok = DecompressBlockPayloadImpl(zstd, stored, block, MAX_BLOCK_SERIALIZED_SIZE);
         }
         if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
             const auto us{Ticks<std::chrono::microseconds>(SteadyClock::now() - decompress_start)};
@@ -1631,11 +1654,36 @@ FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)
     uint8_t flags{0};
     Span<const uint8_t> stored_payload{payload};
     std::vector<uint8_t> compressed;
-    const bool use_extended_header{m_opts.block_zstd};
+    const bool use_typed_blocks{compress::g_dict_bootstrap && compress::g_dict_bootstrap->UseTypedBlockFormat()};
+    const bool bootstrap_pass1{use_typed_blocks && compress::g_dict_bootstrap->IsPass1InProgress()};
+    const bool typed_compress{use_typed_blocks && compress::g_dict_bootstrap->ShouldCompressOnWrite()};
+    const bool use_extended_header{m_opts.block_zstd || use_typed_blocks};
     const uint32_t header_size{use_extended_header ? BLOCK_SERIALIZATION_HEADER_SIZE :
                                                      BLOCK_LEGACY_SERIALIZATION_HEADER_SIZE};
 
-    if (use_extended_header && m_block_zstd) {
+    if (bootstrap_pass1) {
+        const compress::BlockBucket bucket{compress::ClassifyBlock(nHeight, block, GetParams())};
+        flags |= compress::g_dict_bootstrap->BlockFlagsForBucket(bucket);
+        compress::g_dict_bootstrap->OnBlockWritten(nHeight, block, payload);
+    } else if (typed_compress) {
+        const compress::BlockBucket bucket{compress::ClassifyBlock(nHeight, block, GetParams())};
+        flags |= compress::g_dict_bootstrap->BlockFlagsForBucket(bucket);
+        const compress::DictZstd& dict{compress::g_dict_bootstrap->BlockDict(bucket)};
+        if (dict.Compress(payload, compressed, m_opts.block_zstd_level) && compressed.size() < payload.size()) {
+            flags |= BLOCK_SERIALIZATION_FLAG_COMPRESSED;
+            stored_payload = compressed;
+        } else if (!dict && m_block_zstd.Compress(payload, compressed, m_opts.block_zstd_level)
+                   && compressed.size() < payload.size()) {
+            LogPrintf("Warning: missing typed block dictionary for bucket %s; falling back to monolithic dictionary\n",
+                      compress::BlockBucketName(bucket));
+            flags |= BLOCK_SERIALIZATION_FLAG_COMPRESSED;
+            stored_payload = compressed;
+        } else if (!dict) {
+            LogPrintf("Warning: missing typed block dictionary for bucket %s; writing uncompressed payload\n",
+                      compress::BlockBucketName(bucket));
+        }
+        compress::g_dict_bootstrap->OnBlockStored(bucket, payload.size(), stored_payload.size());
+    } else if (use_extended_header && m_block_zstd && (!compress::g_dict_bootstrap || compress::g_dict_bootstrap->ShouldCompressOnWrite())) {
         if (m_block_zstd.Compress(payload, compressed, m_opts.block_zstd_level) &&
             compressed.size() < payload.size()) {
             flags |= BLOCK_SERIALIZATION_FLAG_COMPRESSED;
@@ -1856,6 +1904,9 @@ void ImportBlocks(ChainstateManager& chainman, std::span<const fs::path> import_
             chainman.GetNotifications().fatalError(strprintf(_("Failed to connect best block (%s)."), state.ToString()));
             return;
         }
+    }
+    if (compress::g_dict_bootstrap) {
+        compress::g_dict_bootstrap->OnReindexComplete();
     }
     // End scope of ImportingNow
 }

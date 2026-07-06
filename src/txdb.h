@@ -66,6 +66,11 @@ struct CoinsViewOptions {
     bool flush_snapshot{DEFAULT_FLUSH_SNAPSHOT};
 };
 
+/** Decode a serialized coin value (legacy, compressed, or typed bucket header). */
+bool DecodeCoinValue(std::span<const uint8_t> data, const compress::UtxoZstd& zstd, Coin& coin);
+/** Encode a coin value for chainstate storage. */
+std::vector<uint8_t> EncodeCoinValue(const Coin& coin, const CoinsViewOptions& options, const compress::UtxoZstd& zstd);
+
 /** CCoinsView backed by the coin database (chainstate/)
  * Cursor requires FlushStateToDisk for consistency.
  */

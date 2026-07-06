@@ -1,0 +1,77 @@
+{
+    "inscription_zero_height": 767430,
+    "buckets": [
+        {
+            "name": "BLK_SCRIPTSIG",
+            "kind": "block",
+            "bucket_id": 0,
+            "filename": "blk_scriptsig.dict"
+        },
+        {
+            "name": "BLK_P2WPKH",
+            "kind": "block",
+            "bucket_id": 1,
+            "filename": "blk_p2wpkh.dict"
+        },
+        {
+            "name": "BLK_P2WSH",
+            "kind": "block",
+            "bucket_id": 2,
+            "filename": "blk_p2wsh.dict"
+        },
+        {
+            "name": "BLK_P2TR_PRE_ORD",
+            "kind": "block",
+            "bucket_id": 3,
+            "filename": "blk_p2tr_pre_ord.dict"
+        },
+        {
+            "name": "BLK_P2TR_POST_ORD",
+            "kind": "block",
+            "bucket_id": 4,
+            "filename": "blk_p2tr_post_ord.dict"
+        },
+        {
+            "name": "UTXO_P2PKH",
+            "kind": "utxo",
+            "bucket_id": 0,
+            "filename": "utxo_p2pkh.dict"
+        },
+        {
+            "name": "UTXO_P2SH",
+            "kind": "utxo",
+            "bucket_id": 1,
+            "filename": "utxo_p2sh.dict"
+        },
+        {
+            "name": "UTXO_P2WPKH",
+            "kind": "utxo",
+            "bucket_id": 2,
+            "filename": "utxo_p2wpkh.dict"
+        },
+        {
+            "name": "UTXO_P2WSH",
+            "kind": "utxo",
+            "bucket_id": 3,
+            "filename": "utxo_p2wsh.dict"
+        },
+        {
+            "name": "UTXO_P2TR_PRE_ORD",
+            "kind": "utxo",
+            "bucket_id": 4,
+            "filename": "utxo_p2tr_pre_ord.dict"
+        },
+        {
+            "name": "UTXO_P2TR_POST_ORD",
+            "kind": "utxo",
+            "bucket_id": 5,
+            "filename": "utxo_p2tr_post_ord.dict"
+        },
+        {
+            "name": "UTXO_OTHER",
+            "kind": "utxo",
+            "bucket_id": 6,
+            "filename": "utxo_other.dict"
+        }
+    ]
+}

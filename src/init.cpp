@@ -49,13 +49,13 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <compress/dict_bootstrap.h>
 #include <compress/zstd.h>
 #include <kernel/blockmanager_opts.h>
 #include <node/blockmanager_args.h>
 #include <node/blockstorage.h>
 #include <node/caches.h>
 #include <node/dbcache.h>
-#include <txdb.h>
 #include <node/chainstate.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
@@ -314,6 +314,7 @@ void Shutdown(NodeContext& node)
     /// Be sure that anything that writes files or flushes caches only does this if the respective
     /// module was initialized.
     util::ThreadRename("shutoff");
+    compress::ShutdownDictBootstrap();
     if (node.mempool) node.mempool->AddTransactionsUpdated(1);
 
     StopHTTPRPC();
@@ -547,6 +548,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blockzstddecompress",
                    strprintf("Allow reading zstd-compressed blocks from blk*.dat (default: %u)",
                              kernel::DEFAULT_BLOCK_ZSTD_DECOMPRESS),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-dictbootstrap=<mode>",
+                   "Typed dictionary bootstrap on mainnet: auto (default) starts pass 1 when no complete "
+                   "bootstrap state exists; off disables bootstrap sampling/training",
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-fastprune", "Use smaller block files and lower minimum prune height for testing purposes", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
 #if HAVE_SYSTEM
@@ -1608,6 +1613,10 @@ static ChainstateLoadResult InitAndLoadChainstate(
     };
     Assert(ApplyArgsManOptions(args, blockman_opts)); // no error can happen, already checked in AppInitParameterInteraction
 
+    if (!compress::InitDictBootstrap(args.GetDataDirNet(), chainparams, args, do_reindex)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL, _("Error initializing dictionary bootstrap")};
+    }
+
     // Creating the chainstate manager internally creates a BlockManager, opens
     // the blocks tree db, and wipes existing block files in case of a reindex.
     // The coinsdb is opened at a later point on LoadChainstate.
@@ -2258,6 +2267,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     ChainstateManager& chainman = *Assert(node.chainman);
+    if (compress::g_dict_bootstrap) {
+        compress::g_dict_bootstrap->OnChainReady(chainman.IsInitialBlockDownload());
+    }
     auto& kernel_notifications{*Assert(node.notifications)};
 
     assert(!node.peerman);

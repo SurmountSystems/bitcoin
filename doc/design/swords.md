@@ -99,9 +99,94 @@ Setting `-blockzstd=0` disables the extended header and writes new blocks with t
 - **Reindex**: `-reindex` reads legacy format and may rewrite in compressed format.
 - **No network impact**: Peers still exchange raw blocks; compression is local storage only.
 
-#### Remaining work
+#### Typed dictionary bootstrap (mainnet, two-pass)
 
-- [ ] Train production dictionary from representative mainnet `blk*.dat` sample (bundled dict is a placeholder).
+**Status: Pass 1 and Pass 2 implemented** (sampling, incremental training, compression reindex, effectiveness report).
+
+On **mainnet only**, Swords can bootstrap **per-bucket typed dictionaries** (scriptSig / P2WPKH / P2WSH / P2TR pre/post height 767430 for blocks; script-type UTXO buckets) via a two-pass workflow:
+
+| Pass | State (`<datadir>/swords/bootstrap_state.json`) | Writes | Background work |
+|------|--------------------------------------------------|--------|-----------------|
+| 1 | `pass1_in_progress` | Extended block headers + typed UTXO headers, **uncompressed** payloads (overrides `-blockzstd` / `-utxozstd` on write) | Stratified reservoir sampling to `<datadir>/swords/samples/`; incremental `DictionaryTrainer` writes `*.dict.provisional` |
+| 1 end | `pass1_complete` | — | Final capacity search train; promote `*.dict`; write `<datadir>/swords/bootstrap_baseline.json` |
+| 2 | `pass2_in_progress` → `complete` | Per-bucket zstd compression on `-reindex` | Effectiveness report + `compression_report.json` |
+
+**Datadir state files**
+
+- **`bootstrap_state.json`** — live bootstrap state machine (phase, steady-clock timestamps, per-bucket plaintext byte counters, reservoir `*_samples_seen`). Updated during pass 1 and on pass 1 completion.
+- **`bootstrap_baseline.json`** — immutable pass 1 completion snapshot for Pass 2 comparison. Written once at pass 1 end (atomic tmp + rename) with ISO `pass1_start` / `pass1_end`, `pass1_wall_seconds`, per-bucket `block_plaintext_bytes` / `utxo_plaintext_bytes`, `trained_dicts` entries from `<datadir>/swords/dict_manifest.json` (name, `chosen_size`, `holdout_ratio`, `sample_bytes` for buckets that trained), `state: pass1_complete`, and `next_step: "restart with -reindex for compression pass 2"`.
+- **`compression_report.json`** — written at pass 2 completion (atomic tmp + rename) with per-bucket `plaintext_bytes` (from baseline), `stored_bytes` (pass 2), `compression_ratio`, `savings_percent`, `dict_size`, `holdout_ratio`, plus global totals, `pass1_wall_seconds` / `pass2_wall_seconds`, and optional `recommendations` (when holdout ratio was high at near-max dict capacity but pass 2 savings &lt; 50%).
+
+- **Inscription boundary:** `InscriptionZeroHeight()` → **767430** on mainnet only (`src/compress/dict_classify.cpp`).
+- **On-disk bucket ids:** block flags bits 1–4; UTXO type byte `0x80|bucket_id` (`0x01` compressed remains bucket 0 compat).
+- **Manifest:** `share/swords/dict_manifest.json`; trained dicts resolve from `<datadir>/swords/dicts/` then bundled `share/swords/dicts/`.
+- **Dictionary load cap:** `LoadDictionaryFile` accepts up to **4 MiB** (warns above 1 MiB).
+- **Option:** `-dictbootstrap=<mode>` — `auto` (default on mainnet; starts pass 1 only during IBD when no state file exists), `off` (ignores any on-disk bootstrap state).
+- **Already-synced mainnet:** pass 1 is skipped; normal compression remains enabled. Run a fresh IBD or `-reindex` on a new datadir to collect training samples.
+- **Block classification:** non-coinbase transactions only for scriptSig/witness totals; equal scriptSig/witness bytes use dominant output bucket (P2WPKH wins output-type ties).
+- **Test chains:** bootstrap and typed compression disabled; `InitWarning` if `-dictbootstrap` is set.
+
+**Pass 2 workflow:** When `bootstrap_state.json` is `pass1_complete` and the node starts with `-reindex` (`-dictbootstrap=auto` on mainnet), bootstrap enters `pass2_in_progress`, loads typed `DictSet` from `<datadir>/swords/dicts/`, and keeps metrics active until the full reindex finishes:
+
+1. **Block scan:** `LoadExternalBlockFile` reads pass-1 typed uncompressed blocks; `AcceptBlock` rewrites each via `WriteBlock` with per-bucket compression (instead of reusing old disk positions).
+2. **Chain activation:** `ActivateBestChain` rebuilds chainstate; UTXO entries are re-encoded with typed compression on flush.
+3. **Completion:** After all chainstates finish `ActivateBestChain`, `OnReindexComplete()` writes `compression_report.json` and transitions to `complete`.
+
+Missing per-bucket dictionary files fall back to the monolithic bundled dictionary when available, otherwise write uncompressed (warning logged). Legacy mono-dict blocks (compressed flag only, no bucket bits) always use `share/swords/blk.dict` / `utxo.dict`. Typed-bucket decompression is serial; the parallel decompress pool applies only to legacy mono-dict blocks.
+
+At pass 1 completion the node logs a summary block (grep / parse with `contrib/swords/parse-reindex-log.py` `dict_bootstrap` section). Exact line shapes from `DictBootstrapManager::CompletePass1()` / `SaveBaseline()`:
+
+```
+=== Dictionary bootstrap pass 1 complete (IBD wall time: <N> seconds) ===
+  block <BUCKET> plaintext_bytes=<N>
+  utxo <BUCKET> plaintext_bytes=<N>
+Dictionary bootstrap pass 1 complete; restart with -reindex for compression pass 2
+Dictionary bootstrap baseline written to <datadir>/swords/bootstrap_baseline.json
+```
+
+- Banner: `=== Dictionary bootstrap pass 1 complete (IBD wall time: %d seconds) ===` (no trailing space before `===`).
+- Per-bucket lines: two leading spaces, then `block` or `utxo`, bucket name, `plaintext_bytes=%llu`.
+- Next-step line: `Dictionary bootstrap pass 1 complete; restart with -reindex for compression pass 2` (semicolon before *restart*).
+- Baseline path line is emitted only when `bootstrap_baseline.json` is written successfully (after `SaveState()` succeeds).
+
+At pass 2 completion the node logs an effectiveness report (grep / parse with `contrib/swords/parse-reindex-log.py` `compression_report` section). Exact line shapes from `DictBootstrapManager::CompletePass2()` / `SaveCompressionReport()`:
+
+```
+=== Swords dictionary effectiveness report (pass 2) ===
+Block buckets:
+  <BUCKET>: dict=<N>KiB ratio=<R> holdout=<H> plaintext=<SIZE> stored=<SIZE> saved=<N>%
+UTXO buckets:
+  <BUCKET>: dict=<N>KiB ratio=<R> holdout=<H> plaintext=<SIZE> stored=<SIZE> saved=<N>%
+Global:
+  blocks_plaintext_pass1=<SIZE> blocks_stored_pass2=<SIZE> savings=<N>%
+  utxo_plaintext_pass1=<SIZE> utxo_stored_pass2=<SIZE> savings=<N>%
+  pass1_ibd_hours=<H> pass2_reindex_hours=<H>
+Recommendations:
+  <BUCKET>: holdout=<H> at <N>KiB (<P>% of 4096KiB max); pass 2 savings=<S>% < 50% — rerun pass 1 IBD for more samples
+Dictionary bootstrap pass 2 complete; typed dictionary compression active
+```
+
+- Per-bucket lines use `holdout=<H>` when manifest has `holdout_ratio`; otherwise `holdout=n/a` (no training holdout for that bucket).
+- `Recommendations:` is emitted only when at least one bucket has high holdout ratio (≥ 2.0), `chosen_size` ≥ 90% of the 4096 KiB capacity-search maximum, and pass 2 `savings_percent` &lt; 50%.
+- `contrib/swords/parse-reindex-log.py` prints `compression_report` (and `dict_bootstrap`) even when `blocks==0` (reindex-only logs).
+
+**Pass 2 operator workflow**
+
+```bash
+# After pass 1: bootstrap_state.json is pass1_complete; restart with -reindex
+bitcoind -datadir=~/.bitcoin-swords -reindex -dictbootstrap=auto -connect=0
+
+# When reindex finishes, parse effectiveness report from debug.log
+python3 contrib/swords/parse-reindex-log.py ~/.bitcoin-swords
+# or: just parse-log DATADIR=~/.bitcoin-swords
+
+# Inspect on-disk report
+jq . ~/.bitcoin-swords/swords/compression_report.json
+```
+
+#### Remaining work
+- [ ] `contrib/swords/train-dict` — deferred; use two-pass bootstrap on mainnet IBD instead.
+- [ ] Commit production typed dictionaries to `share/swords/dicts/` after a reference mainnet bootstrap run (bundled dicts remain placeholders until then).
 - [ ] Benchmark decompression overhead during parallel validation at scale.
 - [ ] Evaluate `rev*.dat` undo file compression (out of scope for v1).
 
@@ -384,7 +469,8 @@ Tooling: `just baseline`, `just baseline-compare`, `just parse-log`, `just test-
 
 #### Verification gates
 
-- [x] Unit tests: `blockmanager_tests`, `blockchain_tests`, `cs_main_locking_tests`, `caches_tests`, `utxo_zstd_tests`, `zstd_tests`, `dbwrapper_tests` — must pass
+- [x] Unit tests: `blockmanager_tests`, `blockchain_tests`, `cs_main_locking_tests`, `caches_tests`, `utxo_zstd_tests`, `zstd_tests`, `dbwrapper_tests`, `dict_bootstrap_tests` — must pass
+- [x] Operator log parser: `python3 contrib/swords/test_parse_reindex_log.py -v` — must pass
 - [x] IBD read-path unit tests: `validation_segment_equivalence_tests`, `block_decompress_parallel_tests`, `block_prefetch_queue_tests`, `txdb_prefetch_tests`, `coins_prevouts_tests` (plus overlapping `cs_main_locking_tests`, `blockmanager_tests`, `zstd_tests`) — must pass via `just test-phase-d`
 - [~] `validation_block_tests` — passes in normal runs; `processnewblock_signals_ordering` is nondeterministic under extreme parallel stress (timeout or debug `CheckBlockIndex` assert); same class as upstream; no `TestSubscriber` ordering failures observed in stress runs
 - [x] `validation_chainstatemanager_tests` — LMDB reader-slot hygiene (`mdb_reader_check` before read txns); assumeutxo cases pass
@@ -402,6 +488,12 @@ Tooling: `just baseline`, `just baseline-compare`, `just parse-log`, `just test-
 ```bash
 # Full unit suite
 just test
+
+# Dictionary bootstrap unit tests
+build/bin/test_bitcoin --run_test=dict_bootstrap_tests
+
+# Log parser unit tests
+python3 contrib/swords/test_parse_reindex_log.py -v
 
 # IBD read-path unit tests (justfile variable phase_d_tests)
 just test-phase-d

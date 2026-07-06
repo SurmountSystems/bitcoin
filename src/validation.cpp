@@ -13,6 +13,7 @@
 #include <checkqueue.h>
 #include <clientversion.h>
 #include <common/args.h>
+#include <compress/dict_bootstrap.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
@@ -4223,6 +4224,9 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             // allocation of caches once a chainstate exits initial block download.
             LOCK(::cs_main);
             m_chainman.ApplySyncedCacheProfile();
+            if (compress::g_dict_bootstrap) {
+                compress::g_dict_bootstrap->OnIbdComplete();
+            }
         }
 
         // Write changes periodically to disk, after relay. Release m_chainstate_mutex
@@ -5246,7 +5250,9 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     if (fNewBlock) *fNewBlock = true;
     try {
         FlatFilePos blockPos{};
-        if (dbp) {
+        const bool pass2_rewrite{compress::g_dict_bootstrap
+            && compress::g_dict_bootstrap->ShouldRewriteBlocksOnReindex()};
+        if (dbp && !pass2_rewrite) {
             blockPos = *dbp;
             m_blockman.UpdateBlockInfo(block, pindex->nHeight, blockPos, on_disk_payload_size);
         } else {

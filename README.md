@@ -18,6 +18,8 @@ See the [design document](doc/design/swords.md) for architecture, reasoning, and
 
 **Dedicated datadir:** `~/.bitcoin-swords` (hardlink clone from Core v30; `bitcoin.conf` present). First-start migration completed 2026-06-27; datadir is LMDB-active (`data.mdb` in chainstate, blocks/index, indexes/txindex). Use `-connect=0` for migration smoke — see [doc/design/swords.md](doc/design/swords.md).
 
+**Mainnet typed dictionary bootstrap (two-pass):** On a fresh mainnet datadir, pass 1 runs during IBD (`-dictbootstrap=auto`, default on mainnet): blocks and UTXO are written uncompressed while per-bucket training samples are collected. At pass 1 completion the node writes `bootstrap_baseline.json` and logs a summary; restart with `-reindex` for pass 2, which rewrites blocks and UTXO with typed zstd compression and emits `compression_report.json` plus an effectiveness report in `debug.log`. Parse with `contrib/swords/parse-reindex-log.py`. Details in [doc/design/swords.md](doc/design/swords.md#typed-dictionary-bootstrap-mainnet-two-pass).
+
 ### Example high-RAM configuration
 
 For a machine with 96 GiB RAM (adjust values to your hardware):

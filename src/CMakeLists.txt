@@ -258,6 +258,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   net_processing.cpp
   netgroup.cpp
   node/abort.cpp
+  compress/dict_bootstrap.cpp
+  compress/dict_classify.cpp
   compress/zstd.cpp
   node/blockfile_format.cpp
   node/blockmanager_args.cpp

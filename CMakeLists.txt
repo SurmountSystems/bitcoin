@@ -297,9 +297,14 @@ target_compile_definitions(core_interface INTERFACE
   BLOCK_ZSTD_DICT_INSTALL_PATH="${CMAKE_INSTALL_PREFIX}/share/swords/blk.dict"
   UTXO_ZSTD_DICT_SOURCE_PATH="${PROJECT_SOURCE_DIR}/share/swords/utxo.dict"
   UTXO_ZSTD_DICT_INSTALL_PATH="${CMAKE_INSTALL_PREFIX}/share/swords/utxo.dict"
+  DICT_MANIFEST_SOURCE_PATH="${PROJECT_SOURCE_DIR}/share/swords/dict_manifest.json"
+  DICT_MANIFEST_INSTALL_PATH="${CMAKE_INSTALL_PREFIX}/share/swords/dict_manifest.json"
+  TYPED_DICTS_SOURCE_DIR="${PROJECT_SOURCE_DIR}/share/swords/dicts"
+  TYPED_DICTS_INSTALL_DIR="${CMAKE_INSTALL_PREFIX}/share/swords/dicts"
 )
 
-install(FILES share/swords/blk.dict share/swords/utxo.dict DESTINATION share/swords)
+install(FILES share/swords/blk.dict share/swords/utxo.dict share/swords/dict_manifest.json DESTINATION share/swords)
+install(DIRECTORY share/swords/dicts/ DESTINATION share/swords/dicts OPTIONAL)
 
 if(BUILD_FOR_FUZZING)
   message(WARNING "BUILD_FOR_FUZZING=ON will disable all other targets and force BUILD_FUZZ_BINARY=ON.")
