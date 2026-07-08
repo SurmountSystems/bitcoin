@@ -22,10 +22,12 @@
 #include <util/time.h>
 #include <util/vector.h>
 
+#include <algorithm>
 #include <cassert>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <iterator>
 #include <thread>
 #include <utility>
@@ -37,6 +39,30 @@ static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
 static constexpr uint8_t DB_COINS{'c'};
 
 namespace {
+
+constexpr auto COIN_PREFETCH_COOLDOWN{60s};
+
+std::atomic<int64_t> g_coin_prefetch_cooldown_until_ticks{0};
+std::function<void()> g_coin_prefetch_worker_gate;
+
+bool CoinPrefetchInCooldown()
+{
+    const int64_t until{g_coin_prefetch_cooldown_until_ticks.load(std::memory_order_relaxed)};
+    if (until == 0) return false;
+    return SteadyClock::now().time_since_epoch().count() < until;
+}
+
+void SetCoinPrefetchCooldown()
+{
+    g_coin_prefetch_cooldown_until_ticks.store(
+        (SteadyClock::now() + COIN_PREFETCH_COOLDOWN).time_since_epoch().count(),
+        std::memory_order_relaxed);
+}
+
+void ClearCoinPrefetchCooldown()
+{
+    g_coin_prefetch_cooldown_until_ticks.store(0, std::memory_order_relaxed);
+}
 
 struct CoinDBValue {
     std::vector<uint8_t> bytes;
@@ -252,20 +278,25 @@ bool ParallelPrefetchCoinsImpl(CCoinsViewDB& db,
     std::vector<std::optional<Coin>> results(prevouts.size());
     std::atomic<size_t> next{0};
     std::atomic<bool> readers_full{false};
+    std::atomic<bool> readers_full_logged{false};
     std::atomic<uint64_t> lmdb_us{0};
     std::atomic<uint64_t> decode_us{0};
     const bool bench{util::g_benchstats_enabled.load(std::memory_order_relaxed)};
     std::vector<std::thread> threads;
     threads.reserve(static_cast<size_t>(num_workers));
     for (int worker = 0; worker < num_workers; ++worker) {
-        threads.emplace_back([&]() {
+        threads.emplace_back([&, first_read = true]() mutable {
             while (true) {
                 const size_t index{next.fetch_add(1, std::memory_order_relaxed)};
                 if (index >= prevouts.size()) break;
-                if (readers_full.load(std::memory_order_relaxed)) continue;
+                if (readers_full.load(std::memory_order_relaxed)) break;
                 std::vector<uint8_t> stored_bytes;
                 Coin coin;
                 try {
+                    if (first_read) {
+                        first_read = false;
+                        if (g_coin_prefetch_worker_gate) g_coin_prefetch_worker_gate();
+                    }
                     const auto lmdb_start{SteadyClock::now()};
                     if (!db.ReadStoredCoinBytesForPrefetch(prevouts[index], stored_bytes)) continue;
                     if (bench) {
@@ -281,18 +312,39 @@ bool ParallelPrefetchCoinsImpl(CCoinsViewDB& db,
                     results[index] = std::move(coin);
                 } catch (const dbwrapper_error& e) {
                     if (IsLMDBReadersFullError(e)) {
-                        LogError("Parallel coin prefetch hit MDB_READERS_FULL; falling back to serial for block\n");
+                        if (!readers_full_logged.exchange(true, std::memory_order_relaxed)) {
+                            const int reclaimed{db.ReclaimStaleReaders()};
+                            SetCoinPrefetchCooldown();
+                            if (reclaimed < 0) {
+                                LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Warning,
+                                              "Parallel coin prefetch hit MDB_READERS_FULL; falling back to serial for block "
+                                              "(reader reclaim failed)\n");
+                            } else if (reclaimed > 0) {
+                                LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Warning,
+                                              "Parallel coin prefetch hit MDB_READERS_FULL; falling back to serial for block "
+                                              "(reclaimed %d stale readers)\n",
+                                              reclaimed);
+                            } else {
+                                LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Warning,
+                                              "Parallel coin prefetch hit MDB_READERS_FULL; falling back to serial for block "
+                                              "(no stale readers reclaimed)\n");
+                            }
+                            util::BenchStatsInc(util::g_benchstats.coin_prefetch_readers_full);
+                        }
                         readers_full.store(true, std::memory_order_relaxed);
                     } else {
                         throw;
                     }
                 }
             }
+            db.ReleaseThreadLocalReadTxn();
         });
     }
     for (std::thread& thread : threads) {
         thread.join();
     }
+    // Worker threads cache read txns in thread-local storage; reclaim slots before returning.
+    db.ReclaimStaleReaders();
     if (bench) {
         util::g_benchstats.coin_prefetch_lmdb_us.fetch_add(lmdb_us.load(std::memory_order_relaxed),
                                                            std::memory_order_relaxed);
@@ -325,6 +377,36 @@ compress::UtxoZstd LoadUtxoZstd(const CoinsViewOptions& options)
 }
 
 } // namespace
+
+int ComputeCoinPrefetchWorkers(const int requested_workers, const unsigned int max_readers)
+{
+    if (requested_workers < 2) return 0;
+    const unsigned int available{max_readers > COIN_PREFETCH_READER_RESERVE
+        ? max_readers - COIN_PREFETCH_READER_RESERVE
+        : 0};
+    const int slot_cap{static_cast<int>(available / COIN_PREFETCH_SLOTS_PER_WORKER)};
+    return std::min({requested_workers, MAX_COIN_PREFETCH_PAR, slot_cap});
+}
+
+void ResetCoinPrefetchCooldownForTest()
+{
+    ClearCoinPrefetchCooldown();
+}
+
+void SetCoinPrefetchCooldownForTest()
+{
+    SetCoinPrefetchCooldown();
+}
+
+bool CoinPrefetchInCooldownForTest()
+{
+    return CoinPrefetchInCooldown();
+}
+
+void SetCoinPrefetchWorkerGateForTest(std::function<void()> gate)
+{
+    g_coin_prefetch_worker_gate = std::move(gate);
+}
 
 bool CCoinsViewDB::NeedsUpgrade()
 {
@@ -385,13 +467,25 @@ bool ParallelPrefetchCoins(CCoinsViewDB& db,
                            std::vector<PrefetchedCoin>& out,
                            const int num_workers)
 {
-    if (num_workers < 2 || prevouts.empty()) return false;
+    if (num_workers < 2 || prevouts.empty() || CoinPrefetchInCooldown()) return false;
+    // Validation (or tests) may hold a thread-local read txn; release it for worker budget.
+    db.ReleaseThreadLocalReadTxn();
     return ParallelPrefetchCoinsImpl(db, prevouts, out, num_workers, db.GetUtxoZstdDictionary());
 }
 
 unsigned int CCoinsViewDB::GetMaxReaders() const
 {
     return m_db->GetMaxReaders();
+}
+
+int CCoinsViewDB::ReclaimStaleReaders() const
+{
+    return m_db->ReclaimStaleReaders();
+}
+
+void CCoinsViewDB::ReleaseThreadLocalReadTxn() const
+{
+    m_db->ReleaseThreadLocalReadTxn();
 }
 
 void CCoinsViewDB::WriteCoinValue(CDBBatch& batch, const COutPoint& outpoint, const Coin& coin)
@@ -431,12 +525,12 @@ bool CCoinsViewDB::WritePendingToDisk(const uint256& hashBlock, std::vector<Pend
     assert(!hashBlock.IsNull());
 
     const bool sync_writes = m_options.lmdbsync;
-    const bool sync_final = sync_writes || m_options.sync_final_batch;
+    const bool sync_final = sync_writes || m_sync_final_batch.load(std::memory_order_relaxed);
 
     struct SyncFinalBatchReset {
-        bool& flag;
-        ~SyncFinalBatchReset() { flag = false; }
-    } sync_final_reset{m_options.sync_final_batch};
+        std::atomic<bool>& flag;
+        ~SyncFinalBatchReset() { flag.store(false, std::memory_order_relaxed); }
+    } sync_final_reset{m_sync_final_batch};
 
     auto encode_start{std::chrono::steady_clock::now()};
     auto encode_elapsed{std::chrono::milliseconds::zero()};
@@ -491,8 +585,11 @@ bool CCoinsViewDB::WritePendingToDisk(const uint256& hashBlock, std::vector<Pend
             pause_encode_time();
             LogDebug(BCLog::COINDB, "Writing partial batch of %.2f MiB\n", batch.SizeEstimate() * (1.0 / 1048576.0));
             {
+                const auto lmdb_start{SteadyClock::now()};
                 LOG_TIME_MILLIS_WITH_CATEGORY("write coins partial batch to LMDB", BCLog::BENCH);
                 m_db->WriteBatch(batch, sync_writes);
+                util::BenchStatsAdd(util::g_benchstats.flush_lmdb_us,
+                                    static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - lmdb_start)));
             }
             batch.Clear();
             if (m_options.simulate_crash_ratio) {
@@ -511,14 +608,19 @@ bool CCoinsViewDB::WritePendingToDisk(const uint256& hashBlock, std::vector<Pend
     batch.Write(DB_BEST_BLOCK, hashBlock);
 
     pause_encode_time();
+    util::BenchStatsAdd(util::g_benchstats.flush_encode_us,
+                        static_cast<uint64_t>(Ticks<std::chrono::microseconds>(encode_elapsed)));
     LogDebug(BCLog::BENCH, "BatchWrite: encode coins for db batch completed (%.2fms%s)\n",
              Ticks<MillisecondsDouble>(encode_elapsed),
              parallel_encode ? ", parallel" : "");
     LogDebug(BCLog::COINDB, "Writing final batch of %.2f MiB\n", batch.SizeEstimate() * (1.0 / 1048576.0));
     bool ret;
     {
+        const auto lmdb_start{SteadyClock::now()};
         LOG_TIME_MILLIS_WITH_CATEGORY("write coins final batch to LMDB", BCLog::BENCH);
         ret = m_db->WriteBatch(batch, sync_final);
+        util::BenchStatsAdd(util::g_benchstats.flush_lmdb_us,
+                            static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - lmdb_start)));
     }
     LogDebug(BCLog::COINDB, "Committed %u changed transaction outputs (out of %u) to coin database...\n", (unsigned int)changed, (unsigned int)count);
     return ret;

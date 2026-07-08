@@ -176,6 +176,61 @@ class ParseReindexLogTests(unittest.TestCase):
         self.assertEqual(db["block_plaintext_bytes"], {"BLK_P2TR_POST_ORD": 512})
         self.assertNotIn("BLK_SCRIPTSIG", db["block_plaintext_bytes"])
 
+    def test_parse_log_includes_benchstats_series(self):
+        log = self._write_log([
+            "2026-07-06T16:00:00Z === Swords run started 2026-07-06T16:00:00Z "
+            "(datadir=/tmp/.bitcoin-swords benchstats=1) ===",
+            (
+                "2026-07-06T16:01:40Z benchstats: block disk=5500.0ms decompress=0.0ms "
+                "par_jobs=0 prefetch_hit=0 prefetch_wait=0.0ms | coin prevouts=0 miss=0 "
+                "lmdb=0.0ms decode=0.0ms warm=0.0ms skip_thr=0 skip_wrk=0 readers_full=0 | "
+                "flush chainstate=0.0ms block_index=0.0ms encode=0.0ms lmdb=0.0ms stale=0 "
+                "parallel=0 txindex=0.0ms blkidx_sync=0 connect_cs=7400.0ms | blocks=1000"
+            ),
+        ])
+        stats = self.parser.parse_log(log)
+        self.assertEqual(len(stats["benchstats"]), 1)
+        self.assertIn("benchstats:", stats["benchstats"][0])
+        self.assertEqual(len(stats["benchstats_series"]), 1)
+        self.assertEqual(stats["benchstats_series"][0]["disk"], 5500.0)
+        self.assertIn("run_started", stats["run_metadata"])
+
+    def test_segment_replay_dict_includes_benchstats_summary(self):
+        stats = {
+            "blocks": 0,
+            "load_ms": [],
+            "connect_ms": [],
+            "blocks_per_hr": 0.0,
+            "benchstats_series": [
+                {
+                    "rollup_index": 1,
+                    "wall_s": 100.0,
+                    "blocks": 1000,
+                    "disk": 5000.0,
+                    "connect_cs": 1000.0,
+                    "flush_lmdb": 500.0,
+                    "txindex": 0.0,
+                    "interval_wall_ms": 100000.0,
+                },
+                {
+                    "rollup_index": 2,
+                    "wall_s": 200.0,
+                    "blocks": 1000,
+                    "disk": 6000.0,
+                    "connect_cs": 1200.0,
+                    "flush_lmdb": 600.0,
+                    "txindex": 0.0,
+                    "interval_wall_ms": 100000.0,
+                },
+            ],
+            "run_metadata": {"run_started": {"benchstats": 1}},
+        }
+        seg = self.parser.segment_replay_dict(stats)
+        self.assertIsNotNone(seg)
+        self.assertIn("benchstats_summary", seg)
+        self.assertEqual(seg["benchstats_summary"]["rollup_count"], 2)
+        self.assertIn("run_metadata", seg)
+
 
 if __name__ == "__main__":
     unittest.main()

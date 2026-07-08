@@ -629,7 +629,7 @@ public:
         size_t cache_size_bytes,
         bool in_memory,
         bool should_wipe,
-        fs::path leveldb_name = "chainstate");
+        fs::path leveldb_name = "chainstate") EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Initialize the in-memory coins cache (to be done after the health of the on-disk database
     //! is verified).
@@ -742,7 +742,8 @@ public:
     bool FlushStateToDiskLocked(
         BlockValidationState& state,
         FlushStateMode mode,
-        int nManualPruneHeight = 0) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+        int nManualPruneHeight = 0,
+        util::BenchStatsCsMainHold* outer_cs_main_hold = nullptr) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**
      * After shutdown interrupt, write dirty UTXO cache incrementally to reduce the

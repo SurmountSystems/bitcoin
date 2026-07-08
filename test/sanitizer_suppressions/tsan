@@ -29,6 +29,10 @@ deadlock:src/qt/test/*
 deadlock:libdb
 race:libzmq
 
+# Embedded LMDB: internal locking is not TSan-visible (reader table, txn lifecycle).
+race:lmdb/*
+race:mdb_*
+
 # Intermittent issues
 # -------------------
 #

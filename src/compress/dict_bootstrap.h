@@ -125,6 +125,7 @@ private:
     void TrainBucket(const std::string& kind, uint8_t bucket_id, const std::string& name,
                      std::span<const std::span<const uint8_t>> samples, bool provisional);
     void PromoteProvisionalDicts();
+    void LogHoldoutSummary(bool provisional) const;
 };
 
 /** Typed dictionary bootstrap state machine (mainnet only). */
@@ -194,8 +195,12 @@ private:
     std::thread m_complete_thread;
     std::array<uint64_t, NUM_BLOCK_BUCKETS> m_block_seen{};
     std::array<uint64_t, NUM_UTXO_BUCKETS> m_utxo_seen{};
+    std::atomic<uint64_t> m_pass2_blocks_reindexed{0};
+    std::array<std::atomic<uint64_t>, NUM_BLOCK_BUCKETS> m_pass2_block_plaintext_bytes{};
+    std::array<std::atomic<uint64_t>, NUM_UTXO_BUCKETS> m_pass2_utxo_plaintext_bytes{};
 
     void JoinCompleteThread();
+    void MaybeLogPass2CompressionProgress(uint64_t blocks_reindexed);
     LoadStateResult LoadState();
     bool SaveState() const;
     void EnterPass1();

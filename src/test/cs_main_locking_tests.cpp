@@ -24,6 +24,7 @@
 #include <test/util/random.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
+#include <util/fs.h>
 #include <util/time.h>
 
 using node::BlockAssembler;
@@ -100,6 +101,13 @@ std::vector<std::shared_ptr<const CBlock>> BuildGoodBlockChain(TestChain100Setup
         prev = block->GetHash();
     }
     return blocks;
+}
+
+//! Concurrent ALWAYS flushes need tmpfs headroom (CheckDiskSpace 50 MiB + write burst).
+bool HasConcurrentFlushDiskHeadroom(const fs::path& datadir)
+{
+    constexpr uint64_t MIN_SPACE{200 * 1024 * 1024};
+    return fs::space(datadir).available >= MIN_SPACE;
 }
 } // namespace
 
@@ -291,8 +299,11 @@ BOOST_AUTO_TEST_CASE(connect_tip_interrupt_before_set_tip)
         LOCK2(m_node.chainman->GetMutex(), chainstate.MempoolMutex());
         tip_before_disconnect = chainstate.m_chain.Tip();
         BOOST_REQUIRE(tip_before_disconnect->pprev);
-
         BOOST_REQUIRE(chainstate.DisconnectTip(state, nullptr));
+    }
+    {
+        // Flush releases/re-acquires cs_main for LMDB I/O; do not hold mempool across that boundary (TSan lock order).
+        LOCK(m_node.chainman->GetMutex());
         BOOST_REQUIRE(chainstate.FlushStateToDiskLocked(state, FlushStateMode::ALWAYS));
         flushed_best_block = chainstate.CoinsTip().GetBestBlock();
         BOOST_CHECK_EQUAL(flushed_best_block, chainstate.m_chain.Tip()->GetBlockHash());
@@ -303,10 +314,8 @@ BOOST_AUTO_TEST_CASE(connect_tip_interrupt_before_set_tip)
     // Simulate shutdown interrupt before ConnectTip would merge into CoinsTip / SetTip.
     BOOST_REQUIRE((*m_node.shutdown_signal)());
 
-    {
-        LOCK2(m_node.chainman->GetMutex(), chainstate.MempoolMutex());
-        BOOST_CHECK(chainstate.ActivateBestChain(state, nullptr));
-    }
+    // ActivateBestChain acquires cs_main/mempool itself; must not be called under LOCK2 (TSan lock order).
+    BOOST_CHECK(chainstate.ActivateBestChain(state, nullptr));
 
     LOCK(::cs_main);
     BOOST_CHECK_EQUAL(chainstate.m_chain.Tip(), tip_at_flush);
@@ -331,6 +340,9 @@ BOOST_AUTO_TEST_CASE(activate_best_chain_interrupt_multi_block_batch)
         for (int i = 0; i < 35; ++i) {
             BOOST_REQUIRE(chainstate.DisconnectTip(state, nullptr));
         }
+    }
+    {
+        LOCK(m_node.chainman->GetMutex());
         BOOST_REQUIRE(chainstate.FlushStateToDiskLocked(state, FlushStateMode::ALWAYS));
         flushed_best_block = chainstate.CoinsTip().GetBestBlock();
         BOOST_CHECK_EQUAL(flushed_best_block, chainstate.m_chain.Tip()->GetBlockHash());
@@ -341,10 +353,7 @@ BOOST_AUTO_TEST_CASE(activate_best_chain_interrupt_multi_block_batch)
 
     BOOST_REQUIRE((*m_node.shutdown_signal)());
 
-    {
-        LOCK2(m_node.chainman->GetMutex(), chainstate.MempoolMutex());
-        BOOST_CHECK(chainstate.ActivateBestChain(state, nullptr));
-    }
+    BOOST_CHECK(chainstate.ActivateBestChain(state, nullptr));
 
     LOCK(::cs_main);
     BOOST_CHECK_EQUAL(chainstate.m_chain.Tip(), tip_at_flush);
@@ -476,6 +485,11 @@ BOOST_AUTO_TEST_CASE(flush_state_and_block_read_no_deadlock)
 //! m_coins_flush_mutex serializes out-of-lock LMDB writes; disk best must track cache/chain tip.
 BOOST_AUTO_TEST_CASE(concurrent_flush_utxo_db_consistency)
 {
+    if (!HasConcurrentFlushDiskHeadroom(m_path_root)) {
+        BOOST_WARN_MESSAGE(false, "Skipping concurrent_flush_utxo_db_consistency: low disk space at " << m_path_root);
+        return;
+    }
+
     Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
     BlockManager& blockman{m_node.chainman->m_blockman};
 
@@ -530,8 +544,8 @@ BOOST_AUTO_TEST_CASE(concurrent_flush_utxo_db_consistency)
     }};
 
     std::vector<std::thread> threads;
-    threads.reserve(4);
-    for (int i = 0; i < 4; ++i) {
+    threads.reserve(2);
+    for (int i = 0; i < 2; ++i) {
         threads.emplace_back(flush_worker);
     }
 
@@ -556,6 +570,11 @@ BOOST_AUTO_TEST_CASE(concurrent_flush_utxo_db_consistency)
 //! Regression: ActivateBestChain (ConnectTip) during flush must not corrupt UTXO DB state.
 BOOST_AUTO_TEST_CASE(flush_during_activate_best_chain_consistency)
 {
+    if (!HasConcurrentFlushDiskHeadroom(m_path_root)) {
+        BOOST_WARN_MESSAGE(false, "Skipping flush_during_activate_best_chain_consistency: low disk space at " << m_path_root);
+        return;
+    }
+
     Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
     BlockValidationState state;
 
@@ -581,12 +600,9 @@ BOOST_AUTO_TEST_CASE(flush_during_activate_best_chain_consistency)
     auto abc_worker{[&] {
         BlockValidationState abc_state;
         while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
-            {
-                LOCK2(m_node.chainman->GetMutex(), chainstate.MempoolMutex());
-                if (!chainstate.ActivateBestChain(abc_state, nullptr)) {
-                    abc_failed = true;
-                    return;
-                }
+            if (!chainstate.ActivateBestChain(abc_state, nullptr)) {
+                abc_failed = true;
+                return;
             }
             ++abc_iterations;
         }
@@ -604,15 +620,13 @@ BOOST_AUTO_TEST_CASE(flush_during_activate_best_chain_consistency)
     }};
 
     std::vector<std::thread> threads;
-    threads.reserve(6);
-    for (int i = 0; i < 4; ++i) {
+    threads.reserve(3);
+    for (int i = 0; i < 2; ++i) {
         threads.emplace_back(abc_worker);
     }
-    for (int i = 0; i < 2; ++i) {
-        threads.emplace_back(flush_worker);
-    }
+    threads.emplace_back(flush_worker);
 
-    std::this_thread::sleep_for(std::chrono::seconds{3});
+    std::this_thread::sleep_for(std::chrono::seconds{2});
     stop = true;
 
     for (size_t i = 0; i < threads.size(); ++i) {

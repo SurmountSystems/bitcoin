@@ -13,8 +13,10 @@
 #include <sync.h>
 #include <util/fs.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -40,13 +42,19 @@ static constexpr int DEFAULT_COIN_PREFETCH_PAR{0};
 static constexpr int MAX_COIN_PREFETCH_PAR{8};
 //! Minimum unique uncached prevouts before parallel coin prefetch runs.
 static constexpr size_t COIN_PREFETCH_PARALLEL_THRESHOLD{64};
+//! Reader slots reserved for validation, RPC, txindex, and other non-prefetch readers.
+static constexpr unsigned int COIN_PREFETCH_READER_RESERVE{96};
+//! Estimated LMDB reader slots per prefetch worker: one thread-local read txn plus one slot
+//! headroom for transient overlap (mdb_reader_check, txn begin before TLS cache is populated).
+static constexpr unsigned int COIN_PREFETCH_SLOTS_PER_WORKER{2};
+//! Minimum chainstate maxreaders for any parallel prefetch (reserve + 2 workers * slots).
+static constexpr unsigned int COIN_PREFETCH_MIN_MAXREADERS{
+    COIN_PREFETCH_READER_RESERVE + 2 * COIN_PREFETCH_SLOTS_PER_WORKER};
 
 //! User-controlled performance and debug options.
 struct CoinsViewOptions {
     //! Maximum database write batch size in bytes.
     size_t batch_write_bytes = nDefaultDbBatchSize;
-    //! Sync the final WriteBatch to disk (mdb_env_sync). Set by FlushStateToDisk on ALWAYS.
-    bool sync_final_batch = false;
     //! Sync every chainstate WriteBatch (-lmdbsync, debug/paranoid mode).
     bool lmdbsync = false;
     //! If non-zero, randomly exit when the database is flushed with (1/ratio)
@@ -81,6 +89,8 @@ protected:
     CoinsViewOptions m_options;
     std::unique_ptr<CDBWrapper> m_db;
     compress::UtxoZstd m_utxo_zstd;
+    //! Sync the final WriteBatch to disk (mdb_env_sync). Set by FlushStateToDisk on ALWAYS.
+    std::atomic<bool> m_sync_final_batch{false};
 
     bool ReadCoinValue(const COutPoint& outpoint, Coin& coin) const;
     void WriteCoinValue(CDBBatch& batch, const COutPoint& outpoint, const Coin& coin);
@@ -109,7 +119,7 @@ public:
     void ResizeCache(size_t new_cache_size) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     //! Request mdb_env_sync on the final WriteBatch of the next BatchWrite (reset after use).
-    void SetSyncFinalBatch(bool sync) { m_options.sync_final_batch = sync; }
+    void SetSyncFinalBatch(bool sync) { m_sync_final_batch.store(sync, std::memory_order_relaxed); }
 
     //! Override parallel prefetch worker count (e.g. segment replay tests).
     void SetCoinPrefetchWorkers(int workers) { m_options.coin_prefetch_workers = workers; }
@@ -118,6 +128,12 @@ public:
 
     //! LMDB reader slot limit configured for this database.
     unsigned int GetMaxReaders() const;
+
+    //! Reclaim stale LMDB reader slots (mdb_reader_check). Returns count freed, or -1 on error.
+    int ReclaimStaleReaders() const;
+
+    //! Release this thread's cached read txn (prefetch worker cleanup).
+    void ReleaseThreadLocalReadTxn() const;
 
     //! @returns filesystem path to on-disk storage or std::nullopt if in memory.
     std::optional<fs::path> StoragePath() { return m_db->StoragePath(); }
@@ -132,10 +148,25 @@ struct PendingCoinWrite {
     CoinsCachePair* cache_pair{nullptr};
 };
 
+//! Cap parallel prefetch workers from configured request and LMDB reader budget.
+int ComputeCoinPrefetchWorkers(int requested_workers, unsigned int max_readers);
+
 //! Parallel LMDB reads for coin prefetch (read-only; merge via CCoinsViewCache::WarmCache).
 bool ParallelPrefetchCoins(CCoinsViewDB& db,
                            const std::vector<COutPoint>& prevouts,
                            std::vector<PrefetchedCoin>& out,
                            int num_workers);
+
+//! Reset process-wide prefetch cooldown (unit tests only).
+void ResetCoinPrefetchCooldownForTest();
+
+//! Arm process-wide prefetch cooldown (unit tests only).
+void SetCoinPrefetchCooldownForTest();
+
+//! Query process-wide prefetch cooldown (unit tests only).
+bool CoinPrefetchInCooldownForTest();
+
+//! Optional per-worker gate invoked before the first LMDB read (unit tests only).
+void SetCoinPrefetchWorkerGateForTest(std::function<void()> gate);
 
 #endif // BITCOIN_TXDB_H

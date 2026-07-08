@@ -32,9 +32,9 @@
 #include <sync.h>
 #include <tinyformat.h>
 #include <uint256.h>
+#include <util/benchstats.h>
 #include <undo.h>
 #include <util/batchpriority.h>
-#include <util/benchstats.h>
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/ioprio.h>
@@ -122,7 +122,7 @@ bool BlockTreeDB::ReadLastBlockFile(int& nFile)
     return Read(DB_LAST_BLOCK, nFile);
 }
 
-bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo, const std::unordered_map<std::string, node::PruneLockInfo>& prune_locks)
+bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo, const std::unordered_map<std::string, node::PruneLockInfo>& prune_locks, const bool f_sync)
 {
     CDBBatch batch(*this);
     for (const auto& [file, info] : fileInfo) {
@@ -136,10 +136,10 @@ bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
         if (prune_lock.second.temporary) continue;
         batch.Write(std::make_pair(DB_PRUNE_LOCK, prune_lock.first), prune_lock.second);
     }
-    return WriteBatch(batch, true);
+    return WriteBatch(batch, f_sync);
 }
 
-bool BlockTreeDB::WriteBatchSync(const node::BlockIndexWriteBatch& index_batch)
+bool BlockTreeDB::WriteBatchSync(const node::BlockIndexWriteBatch& index_batch, const bool f_sync)
 {
     CDBBatch batch(*this);
     for (const auto& [file, info] : index_batch.file_info) {
@@ -153,7 +153,7 @@ bool BlockTreeDB::WriteBatchSync(const node::BlockIndexWriteBatch& index_batch)
         if (prune_lock.second.temporary) continue;
         batch.Write(std::make_pair(DB_PRUNE_LOCK, prune_lock.first), prune_lock.second);
     }
-    return WriteBatch(batch, true);
+    return WriteBatch(batch, f_sync);
 }
 
 bool BlockTreeDB::WritePruneLock(const std::string& name, const node::PruneLockInfo& lock_info) {
@@ -707,13 +707,24 @@ void BlockManager::CommitBlockIndexWriteBatch(const BlockIndexWriteBatch& batch)
     }
 }
 
-bool BlockManager::WriteBlockIndexBatch(const BlockIndexWriteBatch& batch)
+bool BlockManager::ShouldSyncBlockIndexWrite(const bool flush_always) const
+{
+    if (m_opts.block_index_sync == 1) return true;
+    if (m_opts.block_index_sync == 0) return flush_always;
+    return flush_always || !IbdParallelReadsAllowed();
+}
+
+bool BlockManager::WriteBlockIndexBatch(const BlockIndexWriteBatch& batch, const bool flush_always)
 {
     AssertLockHeld(m_cs_block_index_write);
     if (batch.empty()) {
         return true;
     }
-    return m_block_tree_db->WriteBatchSync(batch);
+    const bool f_sync{ShouldSyncBlockIndexWrite(flush_always)};
+    if (f_sync) {
+        util::BenchStatsInc(util::g_benchstats.block_index_sync_writes);
+    }
+    return m_block_tree_db->WriteBatchSync(batch, f_sync);
 }
 
 bool BlockManager::WriteBlockIndexDB()
@@ -724,7 +735,10 @@ bool BlockManager::WriteBlockIndexDB()
         batch = PrepareBlockIndexWriteBatch();
     }
     {
+        const auto blkidx_wait_start{SteadyClock::now()};
         LOCK(m_cs_block_index_write);
+        util::BenchStatsAdd(util::g_benchstats.blkidx_mutex_wait_us,
+                            static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - blkidx_wait_start)));
         if (!WriteBlockIndexBatch(batch)) {
             return false;
         }
@@ -1440,6 +1454,7 @@ void BlockPrefetchQueue::Enqueue(const BlockReadLoc& loc, BlockManager& blockman
             ~ActiveWorker()
             {
                 queue.m_active_workers.fetch_sub(1, std::memory_order_relaxed);
+                std::lock_guard lock{queue.m_mutex};
                 queue.m_cv.notify_all();
             }
         } worker{*this};

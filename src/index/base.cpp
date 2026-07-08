@@ -358,6 +358,12 @@ void BaseIndex::ChainStateFlushed(ChainstateRole role, const CBlockLocator& loca
         return;
     }
 
+    if (!FlushPendingIndexWrites()) {
+        FatalErrorf("%s: Failed to flush pending %s writes before chainstate flush boundary",
+                      __func__, GetName());
+        return;
+    }
+
     // No need to handle errors in Commit. If it fails, the error will be already be logged. The
     // best way to recover is to continue, as index cannot be corrupted by a missed commit to disk
     // for an advanced index state.

@@ -8,7 +8,9 @@
 #include <logging.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <util/benchstats.h>
 #include <util/threadnames.h>
+#include <util/time.h>
 
 #include <algorithm>
 #include <iterator>
@@ -127,9 +129,17 @@ private:
             }
             // execute work
             if (do_work) {
-                for (T& check : vChecks) {
-                    local_result = check();
-                    if (local_result.has_value()) break;
+                if (util::g_benchstats_enabled.load(std::memory_order_relaxed)) {
+                    for (T& check : vChecks) {
+                        local_result = check();
+                        util::g_benchstats.script_done.fetch_add(1, std::memory_order_relaxed);
+                        if (local_result.has_value()) break;
+                    }
+                } else {
+                    for (T& check : vChecks) {
+                        local_result = check();
+                        if (local_result.has_value()) break;
+                    }
                 }
             }
             vChecks.clear();
@@ -176,6 +186,7 @@ public:
         }
 
         {
+            util::BenchStatsAdd(util::g_benchstats.script_jobs, vChecks.size());
             LOCK(m_mutex);
             queue.insert(queue.end(), std::make_move_iterator(vChecks.begin()), std::make_move_iterator(vChecks.end()));
             nTodo += vChecks.size();

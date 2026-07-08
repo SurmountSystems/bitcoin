@@ -23,3 +23,6 @@ test/config.ini
 /guix-build-*
 
 /ci/scratch/
+
+# Local benchstats exports (dirname OUT=/ from mis-expanded shell OUT=var); keep for analysis, never commit.
+/OUT=/

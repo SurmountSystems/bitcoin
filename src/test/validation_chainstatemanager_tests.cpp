@@ -72,10 +72,10 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager, TestChain100Setup)
     const uint256 snapshot_blockhash = active_tip->GetBlockHash();
     Chainstate& c2 = WITH_LOCK(::cs_main, return manager.ActivateExistingSnapshot(snapshot_blockhash));
     chainstates.push_back(&c2);
-    c2.InitCoinsDB(
-        /*cache_size_bytes=*/1 << 23, /*in_memory=*/true, /*should_wipe=*/false);
     {
         LOCK(::cs_main);
+        c2.InitCoinsDB(
+            /*cache_size_bytes=*/1 << 23, /*in_memory=*/true, /*should_wipe=*/false);
         c2.InitCoinsCache(1 << 23);
         c2.CoinsTip().SetBestBlock(active_tip->GetBlockHash());
         c2.setBlockIndexCandidates.insert(manager.m_blockman.LookupBlockIndex(active_tip->GetBlockHash()));
@@ -160,8 +160,6 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_rebalance_caches, TestChain100Setup)
     CBlockIndex* snapshot_base{WITH_LOCK(manager.GetMutex(), return manager.ActiveChain()[manager.ActiveChain().Height() / 2])};
     Chainstate& c2 = WITH_LOCK(cs_main, return manager.ActivateExistingSnapshot(*snapshot_base->phashBlock));
     chainstates.push_back(&c2);
-    c2.InitCoinsDB(
-        /*cache_size_bytes=*/1 << 23, /*in_memory=*/true, /*should_wipe=*/false);
 
     // Reset IBD state so IsInitialBlockDownload() returns true and causes
     // MaybeRebalancesCaches() to prioritize the snapshot chainstate, giving it
@@ -174,6 +172,8 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_rebalance_caches, TestChain100Setup)
 
     {
         LOCK(::cs_main);
+        c2.InitCoinsDB(
+            /*cache_size_bytes=*/1 << 23, /*in_memory=*/true, /*should_wipe=*/false);
         c2.InitCoinsCache(1 << 23);
         manager.MaybeRebalanceCaches();
     }

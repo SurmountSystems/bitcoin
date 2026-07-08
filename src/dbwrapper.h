@@ -339,6 +339,12 @@ public:
     //! Configured LMDB reader slot limit for this environment.
     unsigned int GetMaxReaders() const;
 
+    //! Reclaim stale LMDB reader slots (mdb_reader_check). Returns count freed, or -1 on error.
+    int ReclaimStaleReaders() const;
+
+    //! Release this thread's cached read txn for this environment (prefetch worker cleanup).
+    void ReleaseThreadLocalReadTxn() const;
+
     /**
      * Return a new iterator. The caller owns the returned pointer and must
      * delete it before destroying this CDBWrapper.

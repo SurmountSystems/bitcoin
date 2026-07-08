@@ -615,7 +615,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                              "(0 = legacy in-lock Flush/Sync, default: %u)", DEFAULT_FLUSH_SNAPSHOT),
                    ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-benchstats=<n>",
-                   "Enable IBD read-path benchstats counters (1 = on; logs with debug=bench, default: 0)",
+                   "Enable IBD benchstats rollups every 1000 blocks (1 = on; no debug=bench required; default: 0)",
                    ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blockdecompresspar=<n>",
                    strprintf("Parallel block zstd decompress worker threads during IBD reads "
@@ -626,6 +626,15 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                    strprintf("Parallel LMDB coin prefetch worker threads during ConnectBlock "
                              "(0 = auto from -par, 1 = serial only, 2-%d = explicit workers; default: %d)",
                              MAX_COIN_PREFETCH_PAR, DEFAULT_COIN_PREFETCH_PAR),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockindexsync=<mode>",
+                   strprintf("Block index LMDB fsync policy (0 = nosync except ALWAYS/shutdown, "
+                             "1 = always fsync, 2 = auto/nosync during IBD; default: %d)",
+                             kernel::DEFAULT_BLOCK_INDEX_SYNC),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-txindexbatch=<n>",
+                   strprintf("Blocks between txindex LMDB commits during IBD (1 = per-block legacy; default: %u)",
+                             DEFAULT_TXINDEX_BATCH_BLOCKS),
                    ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-allowignoredconf", strprintf("For backwards compatibility, treat an unused %s file in the datadir as a warning, not an error.", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1788,6 +1797,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     util::g_benchstats_enabled.store(args.GetBoolArg("-benchstats", false), std::memory_order_relaxed);
 
+    LogPrintf("=== Swords run started %s (datadir=%s benchstats=%d) ===\n",
+              FormatISO8601DateTime(GetTime()),
+              fs::PathToString(args.GetDataDirNet()),
+              args.GetBoolArg("-benchstats", false));
+
     LogPrintf("Using at most %i automatic connections (%i file descriptors available)\n", nMaxConnections, available_fds);
 
     // Warn about relative -datadir path.
@@ -2267,6 +2281,27 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     ChainstateManager& chainman = *Assert(node.chainman);
+    const unsigned int chainstate_maxreaders{chainman.ActiveChainstate().CoinsDB().GetMaxReaders()};
+    const int requested_coin_prefetch{chainman.m_options.coins_view.coin_prefetch_workers};
+    const int coin_prefetch_workers{ComputeCoinPrefetchWorkers(requested_coin_prefetch, chainstate_maxreaders)};
+    if (requested_coin_prefetch >= 2 && coin_prefetch_workers == 0) {
+        LogPrintf("Coin prefetch parallel disabled: chainstate_maxreaders=%u reserves %u reader slots "
+                  "(need >%u maxreaders for parallel prefetch; raise -dbcache or use -coinprefetchpar=1)\n",
+                  chainstate_maxreaders, COIN_PREFETCH_READER_RESERVE, COIN_PREFETCH_MIN_MAXREADERS - 1);
+    }
+    LogPrintf("Swords LMDB parallelism: benchstats=%d par=%d coinprefetchpar=%lld coin_prefetch_workers=%d "
+              "utxoencodepar=%lld blockdecompresspar=%lld flushsnapshot=%d blockindexsync=%lld txindexbatch=%lld "
+              "chainstate_maxreaders=%u\n",
+              args.GetBoolArg("-benchstats", false),
+              args.GetIntArg("-par", DEFAULT_SCRIPTCHECK_THREADS),
+              args.GetIntArg("-coinprefetchpar", DEFAULT_COIN_PREFETCH_PAR),
+              coin_prefetch_workers,
+              args.GetIntArg("-utxoencodepar", DEFAULT_UTXO_ENCODE_PAR),
+              args.GetIntArg("-blockdecompresspar", kernel::DEFAULT_BLOCK_DECOMPRESS_PAR),
+              args.GetBoolArg("-flushsnapshot", DEFAULT_FLUSH_SNAPSHOT),
+              args.GetIntArg("-blockindexsync", kernel::DEFAULT_BLOCK_INDEX_SYNC),
+              args.GetIntArg("-txindexbatch", DEFAULT_TXINDEX_BATCH_BLOCKS),
+              chainstate_maxreaders);
     if (compress::g_dict_bootstrap) {
         compress::g_dict_bootstrap->OnChainReady(chainman.IsInitialBlockDownload());
     }
@@ -2282,7 +2317,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // ********************************************************* Step 8: start indexers
 
     if (args.GetBoolArg("-txindex", DEFAULT_TXINDEX)) {
-        g_txindex = std::make_unique<TxIndex>(interfaces::MakeChain(node), index_cache_sizes.tx_index, false, do_reindex);
+        const unsigned int txindex_batch{static_cast<unsigned int>(std::max<int64_t>(
+            1, args.GetIntArg("-txindexbatch", DEFAULT_TXINDEX_BATCH_BLOCKS)))};
+        g_txindex = std::make_unique<TxIndex>(interfaces::MakeChain(node), index_cache_sizes.tx_index, false,
+                                              do_reindex, txindex_batch);
         node.indexes.emplace_back(g_txindex.get());
     }
 

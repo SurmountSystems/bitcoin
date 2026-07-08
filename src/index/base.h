@@ -114,6 +114,9 @@ protected:
     /// Write update index entries for a newly connected block.
     [[nodiscard]] virtual bool CustomAppend(const interfaces::BlockInfo& block) { return true; }
 
+    /// Flush any batched index writes before chainstate durability boundaries.
+    [[nodiscard]] virtual bool FlushPendingIndexWrites() { return true; }
+
     /// Virtual method called internally by Commit that can be overridden to atomically
     /// commit more index state.
     virtual bool CustomCommit(CDBBatch& batch) { return true; }

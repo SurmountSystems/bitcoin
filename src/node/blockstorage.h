@@ -68,8 +68,8 @@ class BlockTreeDB : public CDBWrapper
 {
 public:
     using CDBWrapper::CDBWrapper;
-    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo, const std::unordered_map<std::string, node::PruneLockInfo>& prune_locks);
-    bool WriteBatchSync(const node::BlockIndexWriteBatch& batch);
+    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo, const std::unordered_map<std::string, node::PruneLockInfo>& prune_locks, bool f_sync = true);
+    bool WriteBatchSync(const node::BlockIndexWriteBatch& batch, bool f_sync = true);
     bool ReadBlockFileInfo(int nFile, CBlockFileInfo& info);
     bool ReadLastBlockFile(int& nFile);
     bool WriteReindexing(bool fReindexing);
@@ -441,7 +441,8 @@ public:
     //! Clear dirty flags for a batch whose LMDB write succeeded (caller must hold cs_main).
     void CommitBlockIndexWriteBatch(const BlockIndexWriteBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     //! Write a prepared batch to LMDB (requires m_cs_block_index_write; no cs_main).
-    bool WriteBlockIndexBatch(const BlockIndexWriteBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(m_cs_block_index_write);
+    bool WriteBlockIndexBatch(const BlockIndexWriteBatch& batch, bool flush_always = false) EXCLUSIVE_LOCKS_REQUIRED(m_cs_block_index_write);
+    bool ShouldSyncBlockIndexWrite(bool flush_always) const;
     bool LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 

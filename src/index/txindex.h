@@ -6,8 +6,13 @@
 #define BITCOIN_INDEX_TXINDEX_H
 
 #include <index/base.h>
+#include <index/disktxpos.h>
+
+#include <vector>
 
 static constexpr bool DEFAULT_TXINDEX{false};
+//! Default blocks between txindex LMDB commits during IBD (1 = legacy per-block writes).
+static constexpr unsigned int DEFAULT_TXINDEX_BATCH_BLOCKS{100};
 
 /**
  * TxIndex is used to look up transactions included in the blockchain by hash.
@@ -21,18 +26,25 @@ protected:
 
 private:
     const std::unique_ptr<DB> m_db;
+    const unsigned int m_batch_blocks;
+    std::vector<std::pair<uint256, CDiskTxPos>> m_pending_writes;
+    unsigned int m_pending_block_count{0};
 
     bool AllowPrune() const override { return false; }
     bilingual_str GetDisableAction() const override { return _("set -txindex=0"); }
 
 protected:
     bool CustomAppend(const interfaces::BlockInfo& block) override;
+    bool FlushPendingIndexWrites() override;
 
     BaseIndex::DB& GetDB() const override;
 
+    bool FlushPendingWrites();
+
 public:
     /// Constructs the index, which becomes available to be queried.
-    explicit TxIndex(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size, bool f_memory = false, bool f_wipe = false);
+    explicit TxIndex(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size, bool f_memory = false,
+                     bool f_wipe = false, unsigned int batch_blocks = DEFAULT_TXINDEX_BATCH_BLOCKS);
 
     // Destructor is declared because this class contains a unique_ptr to an incomplete type.
     virtual ~TxIndex() override;

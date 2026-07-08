@@ -287,6 +287,8 @@ Confirm in `debug.log`: three `Finished LevelDB -> LMDB migration` lines, `Opene
 | **Large IBD cache vs flush latency** | With `dbcache-ibd=49152` (~31 GiB coinstip + ~286 MiB unused mempool slack), periodic flush during IBD uses `min(-flushutxo-ibd-mib, 15% of coinstip+mempool slack)` (default ~4 GiB), not the synced 90% threshold — so replay triggers periodic flushes much sooner. Shutdown `FlushStateMode::ALWAYS` still flushes whatever dirty set has accumulated and can take many minutes on large caches. Prefer letting `-reindex-chainstate` run to completion over frequent stops. |
 | **Stop / lock workflow** | Use `build/bin/bitcoin-cli -datadir=$HOME/.bitcoin-swords stop` (or `bitcoin-cli` on PATH) and wait for `Shutdown: done` in `debug.log` before restarting. Do not launch a second instance if startup reports a datadir lock error — the prior process may still be flushing. |
 
+<a id="reindex-chainstate-operations"></a>
+
 #### `-reindex-chainstate` operations
 
 Use a dedicated datadir and isolate from the open network during recovery replay (`build/bin/bitcoind` from the Swords tree, or installed `bitcoind` on PATH):
@@ -454,10 +456,11 @@ Measurement pyramid (L0 unit equivalence → L1 microbench → L2 segment replay
 | `BlockDecompressPool` + `-blockdecompresspar` (DEBUG_ONLY; IBD/import gating, ≥32 KiB payloads) | **Implemented** |
 | `BlockPrefetchQueue` depth-1 prefetch in `ActivateBestChainStep` / `ConnectTip` | **Implemented** |
 | `ParallelPrefetchCoins` + `CCoinsViewCache::WarmCache` + `-coinprefetchpar` (DEBUG_ONLY; ≥64 uncached prevouts) | **Implemented** |
+| LMDB reader-slot budgeting for coin prefetch (`ComputeCoinPrefetchWorkers`; reserve headroom for validation/RPC/txindex) | **Implemented** |
 | Parallel UTXO pre-encode (`-utxoencodepar`) | **Implemented** (see §3) |
 | Immutable flush snapshot (`-flushsnapshot=1`) | **Implemented** (see §3) |
 | Ordered `LoadExternalBlockFile` decompress queue | **Deferred** |
-| Promote DEBUG_ONLY flags after mainnet A/B validation | **Deferred** |
+| Promote DEBUG_ONLY flags after mainnet A/B validation | **Gated** — run `just promotion-gates` after sweep campaign |
 
 | Option | Default | Purpose |
 |--------|---------|---------|
@@ -465,23 +468,33 @@ Measurement pyramid (L0 unit equivalence → L1 microbench → L2 segment replay
 | `-blockdecompresspar=<n>` | 0 (auto) | Parallel block zstd decompress workers (DEBUG_ONLY) |
 | `-coinprefetchpar=<n>` | 0 (auto) | Parallel LMDB coin prefetch workers (DEBUG_ONLY) |
 
-Tooling: `just baseline`, `just baseline-compare`, `just parse-log`, `just test-phase-d` (IBD read-path unit tests; recipe name is historical).
+**MDB_READERS_FULL / reader budgeting:** Each prefetch worker holds a thread-local LMDB read txn (`MDB_NOTLS`). Under IBD + RPC + txindex concurrency the reader table can fill; uncapped workers previously logged thousands of `MDB_READERS_FULL` errors per block and disabled prefetch for the rest of the run. Prefetch workers are now capped by `ComputeCoinPrefetchWorkers` (reserves 96 slots for non-prefetch readers; budgets 2 slots per worker for the thread-local txn plus begin overlap). Parallel prefetch requires `chainstate_maxreaders >= 100` (i.e. `>= COIN_PREFETCH_MIN_MAXREADERS`, or `> 99`); at or below that threshold startup logs `Coin prefetch parallel disabled` and validation uses serial `FetchCoin` only. On `MDB_READERS_FULL`, prefetch calls `mdb_reader_check` to reclaim stale slots, logs once per batch (rate-limited elsewhere), arms a 60s process-wide cooldown, and validation continues with serial `FetchCoin`. Operator workarounds: raise `-dbcache` (scales `maxreaders`), or `-coinprefetchpar=1` to force serial prefetch.
+
+Tooling: [IBD profiling and parameter sweeps (Phases 0–6)](#ibd-profiling-and-parameter-sweeps-phases-06); microbench capture via `just baseline` / `just baseline-compare`; `just test-phase-d` (IBD read-path unit tests; recipe name is historical).
 
 #### Verification gates
 
 - [x] Unit tests: `blockmanager_tests`, `blockchain_tests`, `cs_main_locking_tests`, `caches_tests`, `utxo_zstd_tests`, `zstd_tests`, `dbwrapper_tests`, `dict_bootstrap_tests` — must pass
 - [x] Operator log parser: `python3 contrib/swords/test_parse_reindex_log.py -v` — must pass
 - [x] IBD read-path unit tests: `validation_segment_equivalence_tests`, `block_decompress_parallel_tests`, `block_prefetch_queue_tests`, `txdb_prefetch_tests`, `coins_prevouts_tests` (plus overlapping `cs_main_locking_tests`, `blockmanager_tests`, `zstd_tests`) — must pass via `just test-phase-d`
+- [x] `txdb_prefetch_tests` concurrency stress: `ReaderSlotHog` (deterministic reader-slot exhaustion), `MDB_READERS_FULL` cooldown/fallback, partial-budget overlap, repeated-success leak check — covered in `just test-phase-d` (Workstream A3)
+- [x] Benchstats parser `readers_full` / `prefetch_hit` milestones: `python3 contrib/swords/test_benchstats_parse.py -v` and `test_compare_benchstats.py` — must pass via `just test-parse-benchstats` / `just test-compare-benchstats`
+- [x] Phase 0 `check` CLI and shell gate: `run_health_check`, `just phase0-check` exit codes, `readers_full` / `MDB_READERS_FULL` fail-closed — `python3 contrib/swords/test_phase0_live_health.py -v` (`just test-phase0` / `just test-phase0-check`)
+- [x] Phase 6 sweep matrix + campaign gates (53 tests): variant overlays, prefetch gate at #120, milestone compare — `just test-phase6`
 - [~] `validation_block_tests` — passes in normal runs; `processnewblock_signals_ordering` is nondeterministic under extreme parallel stress (timeout or debug `CheckBlockIndex` assert); same class as upstream; no `TestSubscriber` ordering failures observed in stress runs
 - [x] `validation_chainstatemanager_tests` — LMDB reader-slot hygiene (`mdb_reader_check` before read txns); assumeutxo cases pass
 - [x] First-start LevelDB → LMDB migration smoke on a real Core datadir (`~/.bitcoin-swords`); documented procedure with `-connect=0`; `*.leveldb.bak` created; second start skips migration
-- [x] Functional subset: `feature_assumeutxo.py`, `feature_dbcrash.py`, `feature_coinstatsindex.py`, `feature_index_prune.py`
-- [x] Local ThreadSanitizer: `cs_main_locking_tests`, `validation_chainstatemanager_tests`, `validation_block_tests`
+- [x] Functional subset (4-pack): `feature_assumeutxo.py`, `feature_dbcrash.py`, `feature_coinstatsindex.py`, `feature_index_prune.py` — `just test-functional`
+- [x] Local ThreadSanitizer locking gates: `just test-tsan` (`cs_main_locking_tests`, `validation_chainstatemanager_tests`, `txdb_prefetch_tests` in `build-tsan/`)
 - [x] Knots regtest `hash_serialized_3` equivalence at height 101 with compression disabled (see procedure below)
-- [ ] `test/functional/` full suite
-- [ ] ThreadSanitizer CI job
+- [ ] `test/functional/` full suite (~281 scripts; non-blocking — triage template below)
+- [~] ThreadSanitizer CI: upstream `ci_native_tsan` job in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) (container `00_setup_env_native_tsan.sh`); local repro via `just configure-tsan && just test-tsan`
 - [ ] Reproducible chainstate hash comparison against Knots on a fixed block range
+- [x] Promotion gate tests: `just test-promotion-gates` (unit); live campaign check: `just promotion-gates` (exit 1 until sweep passes)
+- [ ] DEBUG_ONLY parallelism promotion (`-benchstats`, `-coinprefetchpar`, `-blockdecompresspar`, `-utxoencodepar`) — **deferred** until `just promotion-gates` returns 0 and operator checklist complete (see below)
 - [x] No change to block acceptance order or rejection reasons (local-only locking changes)
+
+**Aggregate gate:** `just verify` — build + bootstrap + `test-phase-d` + `test-parse-log` + `test-parse-benchstats` + `test-compare-benchstats` + `test-phase3` + `test-baseline` + `test-phase0` + `test-phase5` + `test-phase6` + `test-promotion-gates` + functional 4-pack. This is the curated Swords operator bar, not the full unit suite (`just test`).
 
 #### Reproduction
 
@@ -503,10 +516,22 @@ test/functional/test_runner.py \
   feature_assumeutxo.py feature_dbcrash.py \
   feature_coinstatsindex.py feature_index_prune.py
 
-# Local ThreadSanitizer (requires build-tsan tree)
-build-tsan/bin/test_bitcoin --run_test=cs_main_locking_tests
-build-tsan/bin/test_bitcoin --run_test=validation_chainstatemanager_tests
+# Local ThreadSanitizer locking gates (separate build-tsan/ tree)
+just configure-tsan   # first time only
+just test-tsan        # cs_main_locking_tests + validation_chainstatemanager_tests
+
+# Optional: validation_block_tests under TSan (nondeterministic under extreme stress)
 build-tsan/bin/test_bitcoin --run_test=validation_block_tests
+
+# Phase 0 check + parser gates (also in just verify)
+just test-phase0-check
+just test-parse-benchstats
+
+# Promotion prerequisites (exit 1 until mainnet sweep campaign passes)
+just promotion-gates
+
+# Full verification bar
+just verify
 
 # Optional stress repro for [~] processnewblock_signals_ordering flake
 for i in $(seq 1 20); do
@@ -562,11 +587,223 @@ Reference value at height 101 (compression disabled): `ac2d71cc68ec0f9080c837dac
 
 ---
 
+## IBD profiling and parameter sweeps (Phases 0–6)
+
+**Status: Implemented (operator tooling)**
+
+Swords ships a phased operator workflow for mainnet `-reindex-chainstate` profiling: live health checks, log parsers, microbench gates, kernel traces, and one-knob parameter sweeps. Use a dedicated datadir (default `~/.bitcoin-swords`) and profile-log archive (`~/.bitcoin-swords-profile-logs`). Rebuild after tree changes (`just build-daemon`) so benchstats rollups include current counters (e.g. Phase 4 `wait` fields).
+
+IBD parallelism flags (`-benchstats`, `-coinprefetchpar`, `-blockdecompresspar`, `-utxoencodepar`) remain **DEBUG_ONLY** until a controlled sweep campaign passes the prefetch exit gates below; see [§4](#4-cs_main-locking-improvements) for reader budgeting and promotion criteria.
+
+### Phase overview
+
+| Phase | Recipes | Purpose |
+|-------|---------|---------|
+| 0 | `just watch-cpu`, `just phase0-check` | Live CPU/RSS sampling + automated failure detection during IBD |
+| 1–2 | `just parse-log`, `just baseline-compare` | Segment replay from `debug.log` + microbench regression gates |
+| 3 | `just phase3` | Unified benchstats scorecard (milestones, prefetch health, implied blk/s) |
+| 4 | *(in-process)* | Benchstats `wait` counters in rollups (rebuild required) |
+| 5 | `sudo -E just profile-connectblock`, `sudo -E just profile-utxo-flush` | Kernel-level ConnectBlock / UTXO flush traces (diagnostic) |
+| 6 | `just phase6`, `just sweep-*` | One-knob parameter sweeps with archived A/B matrix |
+
+Additional helpers: `just parse-benchstats`, `just compare-benchstats`, `just export-benchstats`, `just phase0-snapshot`, `just profile-ibd`, `just phase2` (unit tests + baseline compare), `just test-tsan` (local TSan locking gates), `just promotion-gates` (DEBUG_ONLY promotion prerequisites), `just verify` (full tooling + functional gate).
+
+**Datadir defaults:** `justfile` variables `datadir` (`~/.bitcoin-swords`) and `profile_logs` (`~/.bitcoin-swords-profile-logs`). Override with `SWORDS_DATADIR` / `SWORDS_LOG_ARCHIVE` where supported.
+
+### Phase 0 — live health
+
+```bash
+# Background CPU/RSS + block height CSV (Ctrl+C or DURATION= to stop)
+just watch-cpu
+
+# Automated health check (non-zero exit for CI / cron)
+just phase0-check
+```
+
+`just phase0-check` tails `debug.log` from the latest `Swords run started` marker:
+
+| Result | Condition |
+|--------|-----------|
+| **FAIL** (exit 1) | `readers_full > 0` on the latest benchstats rollup, or any `MDB_READERS_FULL` line since run start |
+| **WARN** (exit 0) | `txindex_per_blk_ms` above threshold (default 500 ms/blk), or `prefetch_hit=0` with `coin_prevouts ≥ 64` for the last N rollups (default N=3) |
+| **OK** (exit 0) | None of the above |
+
+Tune thresholds: `just phase0-check TXINDEX_WARN_MS=750 PREFETCH_ROLLUPS=5`.
+
+### Phases 1–2 — log replay and microbench gates
+
+```bash
+just parse-log                    # segment replay metrics from live datadir
+just parse-archived-log latest    # same parser on archived debug.log
+just baseline-compare             # bench_bitcoin medians vs captured baseline
+just phase2                       # test-phase-d then baseline-compare (fail-fast gate)
+```
+
+`just baseline-compare` exit codes are documented in [share/swords/bench-baselines/README.md](../../share/swords/bench-baselines/README.md#compare-exit-codes-just-baseline-compare--baseline_reportpy-compare):
+
+| Code | Meaning |
+|------|---------|
+| 0 | All checks OK |
+| 1 | WARN: segment or benchstats drift (\|delta\| > 10%), missing field, or bench \|delta\| > 10% |
+| 2 | FAIL: any bench median slower than baseline by > 5% |
+
+### Phase 3 — benchstats scorecard
+
+```bash
+just phase3        # human-readable milestone table
+just phase3-json   # machine-readable report
+```
+
+Rollup milestones default to **60, 110, 120, 200, 250** blocks (~117k cliff captured at #120). Reports include `readers_full`, `prefetch_hit`, per-stage ms/blk, and `implied_blk_per_s`.
+
+### Phase 5 — kernel traces (diagnostic)
+
+Requires USDT tracepoints in the running `bitcoind` (`just check-usdt`). Spot-check at rollup milestones **200** and **250** during sweeps:
+
+```bash
+sudo -E just profile-connectblock   # ConnectBlock latency; explains par_jobs=0 in benchstats
+sudo -E just profile-utxo-flush     # UTXO cache flush / LMDB write spikes
+```
+
+These are **not blocking gates**; they explain tail bottlenecks after benchstats identifies them.
+
+### Phase 6 — parameter sweeps and campaign
+
+Each sweep variant changes **one logical knob** vs `baseline`. Reset chain data between variants so comparisons are fair.
+
+```bash
+just sweep-campaign                              # gate status + next recommended variant
+just sweep-apply <variant>                       # write merged bitcoin.conf
+SWORDS_SWEEP_VARIANT=<variant> just reset-datadir && just sweep-start <variant> # stamp archive + fresh replay
+just phase0-check                                # periodic during IBD
+just phase3                                      # milestone scorecard
+just sweep-finish <variant>                      # archive debug.log + sweep-record
+just sweep-compare                               # cross-variant milestone matrix
+```
+
+**Campaign order** (`just sweep-campaign`):
+
+1. `prefetch_serial` — control (`-coinprefetchpar=1`; safe until parallel prefetch validated)
+2. `baseline` — Swords IBD defaults (auto prefetch after reader budgeting fix)
+3. `txindex_500` — optional (`-txindexbatch=500`; skip unless txindex is a hotspot)
+4. `flush_128m` / `flush_256m` — only when `flush_lmdb_per_blk_ms` hotspot detected across recorded variants
+5. `script_par` — explicit `-par=N-1` (override: `SWORDS_SWEEP_PAR=<n>`)
+6. `explicit_parallel` — blocked until **baseline prefetch gate** passes at rollup **#120** (`readers_full=0`, `prefetch_hit>0`)
+
+`just sweep-finish baseline` requires rollup #120 in the archived log; the prefetch gate **fails closed** if that milestone is missing.
+
+**Production exit gates** (before promoting DEBUG_ONLY parallelism defaults):
+
+Run `just promotion-gates` after the sweep campaign; it exits **0** only when automated gates pass (otherwise **1**). Operator steps below are printed but not auto-checked.
+
+| Gate | Check |
+|------|-------|
+| Flags still DEBUG_ONLY | `contrib/swords/promotion_gates.py` reads `src/init.cpp` — all four flags must retain `ArgsManager::DEBUG_ONLY` |
+| Sweep control recorded | `prefetch_serial` and `baseline` variants in `phase6-sweep-state.json` |
+| Baseline prefetch gate | Rollup **#120**: `readers_full=0`, `prefetch_hit>0` (`baseline_passes_prefetch_gate`) |
+| A/B throughput | `baseline` `implied_blk_per_s` > `prefetch_serial` at milestones **120, 200, 250** |
+| IBD depth | Baseline log rollup **#250** with `readers_full=0`, `prefetch_hit>0` (~250k blocks) |
+| Operator: live health | `just phase0-check` returns 0 during healthy IBD |
+| Operator: verify bar | `just verify` green |
+| Operator: campaign tail | `explicit_parallel` variant recorded after baseline gate passes |
+| Promotion edit | Remove `DEBUG_ONLY` from `-benchstats`, `-coinprefetchpar`, `-blockdecompresspar`, `-utxoencodepar` in `src/init.cpp` **only after** `just promotion-gates` returns 0 and operator checklist is complete |
+
+**Functional full suite (non-blocking):** triage with `test/functional/test_runner.py --help`; representative run:
+
+```bash
+# Stop local Swords bitcoind first. Full suite is hours; start with extended subset or --exclude.
+test/functional/test_runner.py --combinedlogslen=4000
+# Status: unchecked — track failures in issue/PR when run completes
+```
+
+Startup confirms effective flags:
+
+```bash
+grep 'Swords LMDB parallelism' ~/.bitcoin-swords/debug.log
+grep 'Swords run started' ~/.bitcoin-swords/debug.log
+```
+
+Sweep state JSON lives under the profile-log archive (outside the datadir); see `just sweep-status` and `just phase6`.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| `MDB_READERS_FULL` in log or `readers_full > 0` in benchstats | LMDB reader table exhausted under parallel coin prefetch + txindex/RPC concurrency (~117k blocks on large `dbcache-ibd`) | Immediate: `just sweep-apply prefetch_serial` or `-coinprefetchpar=1` in `bitcoin.conf`. Long-term: reader budgeting in [§4 IBD read parallelism](#4-cs_main-locking-improvements) (`ComputeCoinPrefetchWorkers`). Raise `-dbcache` if `maxreaders` is low. |
+| `Excessive logging detected` / suppressed `coindb` lines | Thousands of `MDB_READERS_FULL` `LogError` lines tripped Bitcoin's per-source log rate limiter | Fix prefetch reader storm (above); do not treat suppression as benign — prefetch is likely dead for the rest of the run. |
+| `prefetch_hit=0` with `coin_prevouts ≥ 64` | Parallel prefetch disabled after reader exhaustion or cooldown | Confirm `grep -i readers_full` / `just phase0-check`. Compare `prefetch_serial` vs `baseline` in `just sweep-compare`. |
+| `txindex_per_blk_ms` rising to seconds/blk | txindex LMDB map growth (see [disk budgeting](#ibd-disk-and-resource-budgeting) below) | Ensure ~1 TB disk headroom; try optional `txindex_500` variant; Phase 5 traces at milestones 200/250. |
+| `ThreadRPCServer incorrect password attempt` on RPC | Node reachable from non-localhost | Bind RPC to localhost (`rpcbind=127.0.0.1`, `rpcallowip=127.0.0.1/32`) and firewall external ports; see [Security and production hygiene](#security-and-production-hygiene). |
+| `par_jobs=0` in benchstats | Expected when script-check parallelism is idle or gated; not alone a failure | Use Phase 5 `profile-connectblock` at tail milestones to see ConnectBlock breakdown. |
+| Phase 4 `wait` counters missing | Stale `bitcoind` binary | `just build-daemon` and restart IBD. |
+
+**Log hygiene:** enable `debug=bench` / `debug=coindb` only in short profiling windows; comment out for long unattended runs (see [Security and production hygiene](#security-and-production-hygiene) and §2 [`-reindex-chainstate` operations](#reindex-chainstate-operations)).
+
+---
+
+## Security and production hygiene
+
+Operator practices for mainnet IBD profiling on a dedicated datadir (`~/.bitcoin-swords`) and profile-log archive (`~/.bitcoin-swords-profile-logs`). These items do not change consensus; they reduce attack surface and accidental data exposure during long `-reindex-chainstate` campaigns.
+
+### RPC exposure
+
+For profiling and unattended IBD, bind JSON-RPC to loopback only. Set these in the **base** `bitcoin.conf` before `just sweep-apply` — variant overlays do not override RPC settings:
+
+```ini
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1/32
+# rpcport=8332   # optional; default mainnet RPC port
+```
+
+`rpcbind` selects the listen address; `rpcallowip` must also permit the client subnet ([`doc/JSON-RPC-interface.md`](../JSON-RPC-interface.md)). Set **both** together for intentional localhost-only binding — `-rpcbind` alone is ignored without `-rpcallowip`, and `-rpcallowip` without `-rpcbind` triggers an upstream warning and may not produce the expected listen surface.
+
+Lines such as `ThreadRPCServer incorrect password attempt from <addr>` in `debug.log` (from [`src/httprpc.cpp`](../src/httprpc.cpp)) indicate a remote host reached RPC and guessed credentials. That is a common internet-wide probe pattern when RPC is reachable from non-localhost — not necessarily a local misconfiguration of `rpcpassword`. Remediation: localhost bindings above, host firewall on the RPC port, and never expose RPC to the open internet during profiling.
+
+### Profile-log archive privacy
+
+`just reset-datadir` archives `debug.log` under `profile_logs` (default `~/.bitcoin-swords-profile-logs`) with a `meta.txt` that records `source_datadir`, host-local paths, and optional `sweep_variant=`. Archived logs may also include absolute paths, peer addresses, and Phase 5 `perf.data` kernel traces.
+
+- Create or use a profile-log root readable only by the operator (`chmod 700`). When the datadir already exists (the normal profiling path), `just reset-datadir` `mkdir -p` the archive root and sets mode `0700` on it (and on each stamp subdirectory when a log is archived); first-time datadir creation exits before archive setup. Chmod is best-effort (`2>/dev/null || true`) and may fail on some network filesystems.
+- Override location with `SWORDS_LOG_ARCHIVE` if the default under `$HOME` is synced or shared.
+- Treat archives like credentials: do not copy to public issue trackers without redacting paths and RPC-related lines.
+
+### Sweep variant stamping
+
+Phase 6 archives are easier to audit when `meta.txt` includes `sweep_variant=<id>`:
+
+```bash
+just sweep-apply baseline
+SWORDS_SWEEP_VARIANT=baseline just reset-datadir && just sweep-start baseline
+# … IBD to milestones …
+just sweep-finish baseline                        # exports variant before archive + sweep-record
+```
+
+Each `just` recipe runs in a separate process. `sweep-finish` exports `SWORDS_SWEEP_VARIANT` before `reset-datadir` and `sweep-record` in one bash recipe, so archives are stamped automatically. For a manual mid-run reset (e.g. before `sweep-start`), set `SWORDS_SWEEP_VARIANT=<variant>` on the **same shell line** as `just reset-datadir`. `sweep-record` rejects a mismatch between `--variant` and the env.
+
+### Log volume
+
+High-volume `debug=bench` / `debug=coindb` categories are for short profiling windows only. Comment them out for long unattended IBD runs — see §2 [`-reindex-chainstate` operations](#reindex-chainstate-operations) and the troubleshooting table above (log hygiene row).
+
+---
+
+## IBD disk and resource budgeting
+
+Mainnet IBD with `txindex=1` grows the txindex LMDB map substantially during sync. Observed on Swords mainnet runs: **16 GiB → ~512 GiB by ~292k blocks**. Plan **~1 TB** free disk headroom for a full mainnet IBD including blocks, chainstate, and txindex.
+
+For high-RAM nodes, pair **`reservedram=4096`** with an explicit IBD cache override **`dbcache-ibd=49152`** (48 GiB) so auto formulas leave headroom for the OS and other services while maximizing validation throughput. See [bitcoin-conf.md](../bitcoin-conf.md#bitcoin-swords-options) for all options.
+
+---
+
 ## Configuration summary
 
 Example `bitcoin.conf` for a 96 GiB machine:
 
 ```ini
+# Production IBD profiling: RPC localhost-only (see Security and production hygiene).
+# Set in base bitcoin.conf before `just sweep-apply` — overlays do not change RPC keys.
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1/32
+
 reservedram=4096
 dbcache-ibd=49152
 # Conservative override; auto synced ≈ 23 GiB with 96 GiB RAM and reservedram=4096
@@ -587,6 +824,7 @@ See [bitcoin-conf.md](../bitcoin-conf.md#bitcoin-swords-options) for all options
 
 ## Related documentation
 
+- [share/swords/bench-baselines/README.md](../../share/swords/bench-baselines/README.md) — microbench baseline capture and compare exit codes
 - [cs_main_invariants.md](cs_main_invariants.md) — `cs_main` locking invariants (feature 4)
 - [files.md](../files.md) — on-disk format changes
 - [dependencies.md](../dependencies.md) — LMDB, zstd

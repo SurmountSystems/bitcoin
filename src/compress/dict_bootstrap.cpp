@@ -432,6 +432,59 @@ void DictionaryTrainer::TrainAllBuckets(const bool final_train)
     if (final_train) {
         PromoteProvisionalDicts();
     }
+    LogHoldoutSummary(!final_train);
+}
+
+void DictionaryTrainer::LogHoldoutSummary(const bool provisional) const
+{
+    const fs::path manifest_path{m_dicts_dir.parent_path() / "dict_manifest.json"};
+    if (!fs::exists(manifest_path)) return;
+
+    std::ifstream in{manifest_path};
+    if (!in.is_open()) return;
+    UniValue root;
+    if (!root.read(std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()})
+        || !root.isObject() || !root["buckets"].isArray()) {
+        return;
+    }
+
+    std::vector<std::string> parts;
+    const UniValue& buckets{root["buckets"]};
+    for (size_t i = 0; i < buckets.size(); ++i) {
+        const UniValue& entry{buckets[i]};
+        if (!entry.isObject() || !entry["name"].isStr() || !entry["holdout_ratio"].isNum()) continue;
+        const std::string name{entry["name"].get_str()};
+        const double holdout{entry["holdout_ratio"].get_real()};
+        std::string dict_size{"n/a"};
+        if (entry["chosen_size"].isNum()) {
+            const size_t bytes{entry["chosen_size"].getInt<size_t>()};
+            dict_size = bytes >= 1024 ? strprintf("%zuKiB", (bytes + 1023) / 1024) : strprintf("%zuB", bytes);
+        }
+        uint64_t samples{0};
+        for (size_t b = 0; b < NUM_BLOCK_BUCKETS; ++b) {
+            if (BlockBucketName(static_cast<BlockBucket>(b)) == name) {
+                samples = m_collector.BlockSeenCount(static_cast<BlockBucket>(b));
+                break;
+            }
+        }
+        if (samples == 0) {
+            for (size_t b = 0; b < NUM_UTXO_BUCKETS; ++b) {
+                if (UtxoBucketName(static_cast<UtxoBucket>(b)) == name) {
+                    samples = m_collector.UtxoSeenCount(static_cast<UtxoBucket>(b));
+                    break;
+                }
+            }
+        }
+        parts.push_back(strprintf("%s holdout=%.2f dict=%s samples=%llu", name, holdout, dict_size, samples));
+    }
+    if (parts.empty()) return;
+
+    std::string summary;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) summary += " | ";
+        summary += parts[i];
+    }
+    LogPrintf("dictbootstrap: holdout summary (provisional=%d): %s\n", provisional, summary);
 }
 
 void DictionaryTrainer::ThreadMain()
@@ -453,16 +506,22 @@ void DictionaryTrainer::ThreadMain()
         }
 
         for (size_t i = 0; i < NUM_BLOCK_BUCKETS; ++i) {
-            const uint64_t current{m_collector.BlockSampleBytes(static_cast<BlockBucket>(i))};
+            const auto bucket{static_cast<BlockBucket>(i)};
+            const uint64_t current{m_collector.BlockSampleBytes(bucket)};
             const uint64_t last{m_last_block_train_bytes[i].load(std::memory_order_relaxed)};
-            if (last > 0 && current >= last * 2) {
+            if (last == 0 && m_collector.BlockSeenCount(bucket) >= 2) {
+                should_train = true;
+            } else if (last > 0 && current >= last * 2) {
                 should_train = true;
             }
         }
         for (size_t i = 0; i < NUM_UTXO_BUCKETS; ++i) {
-            const uint64_t current{m_collector.UtxoSampleBytes(static_cast<UtxoBucket>(i))};
+            const auto bucket{static_cast<UtxoBucket>(i)};
+            const uint64_t current{m_collector.UtxoSampleBytes(bucket)};
             const uint64_t last{m_last_utxo_train_bytes[i].load(std::memory_order_relaxed)};
-            if (last > 0 && current >= last * 2) {
+            if (last == 0 && m_collector.UtxoSeenCount(bucket) >= 2) {
+                should_train = true;
+            } else if (last > 0 && current >= last * 2) {
                 should_train = true;
             }
         }
@@ -1039,16 +1098,24 @@ void DictBootstrapManager::EnterPass2()
     LogPrintf("Dictionary bootstrap pass 2 started: compression reindex with typed dictionaries\n");
 }
 
-void DictBootstrapManager::OnBlockStored(const BlockBucket bucket, const size_t /*plaintext_bytes*/, const size_t stored_bytes)
+void DictBootstrapManager::OnBlockStored(const BlockBucket bucket, const size_t plaintext_bytes, const size_t stored_bytes)
 {
     if (m_phase != BootstrapPhase::PASS2_IN_PROGRESS) return;
-    m_metrics.block_stored_bytes[static_cast<size_t>(bucket)].fetch_add(stored_bytes, std::memory_order_relaxed);
+    const size_t idx{static_cast<size_t>(bucket)};
+    m_pass2_block_plaintext_bytes[idx].fetch_add(plaintext_bytes, std::memory_order_relaxed);
+    m_metrics.block_stored_bytes[idx].fetch_add(stored_bytes, std::memory_order_relaxed);
+    const uint64_t blocks_reindexed{m_pass2_blocks_reindexed.fetch_add(1, std::memory_order_relaxed) + 1};
+    if (blocks_reindexed % 1000 == 0) {
+        MaybeLogPass2CompressionProgress(blocks_reindexed);
+    }
 }
 
-void DictBootstrapManager::OnCoinStored(const UtxoBucket bucket, const size_t /*plaintext_bytes*/, const size_t stored_bytes)
+void DictBootstrapManager::OnCoinStored(const UtxoBucket bucket, const size_t plaintext_bytes, const size_t stored_bytes)
 {
     if (m_phase != BootstrapPhase::PASS2_IN_PROGRESS) return;
-    m_metrics.utxo_stored_bytes[static_cast<size_t>(bucket)].fetch_add(stored_bytes, std::memory_order_relaxed);
+    const size_t idx{static_cast<size_t>(bucket)};
+    m_pass2_utxo_plaintext_bytes[idx].fetch_add(plaintext_bytes, std::memory_order_relaxed);
+    m_metrics.utxo_stored_bytes[idx].fetch_add(stored_bytes, std::memory_order_relaxed);
 }
 
 namespace {
@@ -1181,6 +1248,63 @@ std::vector<std::string> CollectCompressionRecommendations(const DictSet& dicts,
 }
 
 } // namespace
+
+void DictBootstrapManager::MaybeLogPass2CompressionProgress(const uint64_t blocks_reindexed)
+{
+    std::vector<std::string> bucket_parts;
+    uint64_t total_block_plaintext{0};
+    uint64_t total_block_stored{0};
+    uint64_t total_utxo_plaintext{0};
+    uint64_t total_utxo_stored{0};
+    for (size_t i = 0; i < NUM_BLOCK_BUCKETS; ++i) {
+        const auto bucket{static_cast<BlockBucket>(i)};
+        const std::string name{BlockBucketName(bucket)};
+        const uint64_t plaintext{m_pass2_block_plaintext_bytes[i].load(std::memory_order_relaxed)};
+        const uint64_t stored{m_metrics.block_stored_bytes[i].load(std::memory_order_relaxed)};
+        if (plaintext == 0 && stored == 0) continue;
+        total_block_plaintext += plaintext;
+        total_block_stored += stored;
+        const double ratio{stored > 0 ? static_cast<double>(plaintext) / static_cast<double>(stored) : 0.0};
+        const auto holdout{ManifestHoldoutRatio(Dicts(), name)};
+        if (holdout) {
+            bucket_parts.push_back(strprintf("block %s saved=%d%% ratio=%.2f holdout=%.2f",
+                                             name,
+                                             SavingsPercent(plaintext, stored),
+                                             ratio,
+                                             *holdout));
+        } else {
+            bucket_parts.push_back(strprintf("block %s saved=%d%% ratio=%.2f",
+                                             name,
+                                             SavingsPercent(plaintext, stored),
+                                             ratio));
+        }
+    }
+    for (size_t i = 0; i < NUM_UTXO_BUCKETS; ++i) {
+        const auto bucket{static_cast<UtxoBucket>(i)};
+        const std::string name{UtxoBucketName(bucket)};
+        const uint64_t plaintext{m_pass2_utxo_plaintext_bytes[i].load(std::memory_order_relaxed)};
+        const uint64_t stored{m_metrics.utxo_stored_bytes[i].load(std::memory_order_relaxed)};
+        if (plaintext == 0 && stored == 0) continue;
+        total_utxo_plaintext += plaintext;
+        total_utxo_stored += stored;
+        const double ratio{stored > 0 ? static_cast<double>(plaintext) / static_cast<double>(stored) : 0.0};
+        bucket_parts.push_back(strprintf("utxo %s saved=%d%% ratio=%.2f",
+                                         name,
+                                         SavingsPercent(plaintext, stored),
+                                         ratio));
+    }
+
+    std::string summary;
+    for (size_t i = 0; i < bucket_parts.size(); ++i) {
+        if (i > 0) summary += " | ";
+        summary += bucket_parts[i];
+    }
+    if (!summary.empty()) summary += " | ";
+    summary += strprintf("global blocks_saved=%d%% utxo_saved=%d%%",
+                         SavingsPercent(total_block_plaintext, total_block_stored),
+                         SavingsPercent(total_utxo_plaintext, total_utxo_stored));
+    LogPrintf("dictbootstrap: compression progress (blocks_reindexed=%llu): %s\n", blocks_reindexed, summary);
+}
 
 bool DictBootstrapManager::SaveCompressionReport() const
 {

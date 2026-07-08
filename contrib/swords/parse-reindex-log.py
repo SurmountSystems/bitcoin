@@ -8,9 +8,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-TS_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+"
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import benchstats_parse
+
+parse_ts = benchstats_parse.parse_ts
+strip_ts_prefix = benchstats_parse.strip_ts_prefix
+p50 = benchstats_parse.p50
+
 LOAD_RE = re.compile(r"Load block from disk: ([0-9.]+)ms")
 CONNECT_RE = re.compile(r"Connect (\d+) transactions: ([0-9.]+)ms")
 BATCH_ENCODE_RE = re.compile(
@@ -19,7 +23,6 @@ BATCH_ENCODE_RE = re.compile(
 BATCH_WRITE_RE = re.compile(
     r"write coins (?:partial|final) batch to LMDB completed \(([0-9.]+)ms\)"
 )
-BENCHSTATS_RE = re.compile(r"^benchstats:")
 DICT_BOOTSTRAP_COMPLETE_RE = re.compile(
     r"=== Dictionary bootstrap pass 1 complete \(IBD wall time: (\d+) seconds\) ==="
 )
@@ -56,36 +59,6 @@ COMPRESSION_REPORT_COMPLETE_RE = re.compile(
 )
 
 
-def parse_ts(line: str) -> datetime | None:
-    m = TS_RE.match(line)
-    if not m:
-        return None
-    raw = m.group("ts")
-    if "." in raw:
-        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S.%fZ")
-    return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
-
-
-def strip_ts_prefix(line: str) -> str:
-    """Return log message body with leading ISO timestamp removed, if present."""
-    m = TS_RE.match(line)
-    if m:
-        # TS_RE ends with \\s+; strip only the timestamp and one separator space
-        # so indented pass 2 bucket/recommendation lines keep leading whitespace.
-        ts_end = m.end("ts")
-        if ts_end < len(line) and line[ts_end] == " ":
-            return line[ts_end + 1 :]
-        return line[ts_end:]
-    return line
-
-
-def p50(vals: list[float]) -> float:
-    if not vals:
-        return 0.0
-    s = sorted(vals)
-    return s[len(s) // 2]
-
-
 def parse_log(path: Path) -> dict:
     blocks = 0
     load_ms: list[float] = []
@@ -106,8 +79,10 @@ def parse_log(path: Path) -> dict:
     compression_section: str | None = None
     first_ts: datetime | None = None
     last_ts: datetime | None = None
+    benchstats_rollups: list[tuple[str, dict]] = []
 
-    for line in path.read_text(errors="replace").splitlines():
+    lines = path.read_text(errors="replace").splitlines()
+    for line in lines:
         ts = parse_ts(line)
         if m := LOAD_RE.search(line):
             load_ms.append(float(m.group(1)))
@@ -122,8 +97,12 @@ def parse_log(path: Path) -> dict:
             batch_encode_ms.append(float(m.group(1)))
         if m := BATCH_WRITE_RE.search(line):
             batch_write_ms.append(float(m.group(1)))
-        if BENCHSTATS_RE.search(line):
+        body = strip_ts_prefix(line)
+        if benchstats_parse.BENCHSTATS_RE.search(body):
             benchstats.append(line)
+            rollup = benchstats_parse.parse_benchstats_line(line)
+            if rollup is not None:
+                benchstats_rollups.append((line, rollup))
         if m := DICT_BOOTSTRAP_COMPLETE_RE.search(line):
             dict_bootstrap = {"pass1_wall_seconds": int(m.group(1))}
             dict_block_bytes = {}
@@ -216,6 +195,12 @@ def parse_log(path: Path) -> dict:
         if elapsed_s > 0:
             blocks_per_hr = blocks / elapsed_s * 3600.0
 
+    run_start = benchstats_parse.run_start_ts_from_lines(lines)
+    benchstats_series = benchstats_parse.finish_benchstats_series(
+        benchstats_rollups, run_start
+    )
+    run_metadata = benchstats_parse.parse_run_metadata_from_lines(lines)
+
     return {
         "blocks": blocks,
         "load_ms": load_ms,
@@ -223,6 +208,8 @@ def parse_log(path: Path) -> dict:
         "batch_encode_ms": batch_encode_ms,
         "batch_write_ms": batch_write_ms,
         "benchstats": benchstats,
+        "benchstats_series": benchstats_series,
+        "run_metadata": run_metadata,
         "dict_bootstrap": dict_bootstrap,
         "compression_report": compression_report,
         "blocks_per_hr": blocks_per_hr,
@@ -313,15 +300,23 @@ def segment_replay_dict(stats: dict) -> dict | None:
         out["dict_bootstrap"] = stats["dict_bootstrap"]
     if stats.get("compression_report"):
         out["compression_report"] = stats["compression_report"]
+    series = stats.get("benchstats_series") or []
+    if series:
+        out["benchstats_summary"] = benchstats_parse.benchstats_summary(series)
+    if stats.get("run_metadata"):
+        out["run_metadata"] = stats["run_metadata"]
     return out or None
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("datadir", nargs="?", default=str(Path.home() / ".bitcoin-swords"))
+    ap.add_argument("datadir", nargs="?", default=str(Path.home() / ".bitcoin-swords"),
+                    help="datadir (uses debug.log) or direct path to a debug.log file")
+    ap.add_argument("--log", dest="log_path", default=None,
+                    help="explicit debug.log path (overrides datadir/debug.log)")
     ap.add_argument("--json", action="store_true", help="emit segment_replay JSON only")
     args = ap.parse_args()
-    log = Path(args.datadir) / "debug.log"
+    log = benchstats_parse.resolve_log_path(args.datadir, args.log_path)
     if not log.exists():
         print(f"Missing {log}", file=sys.stderr)
         sys.exit(1)

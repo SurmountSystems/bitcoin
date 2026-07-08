@@ -98,6 +98,13 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, BlockManager::Op
         opts.block_decompress_workers = std::min<int>(kernel::MAX_BLOCK_DECOMPRESS_PAR, std::max<int64_t>(1, script_threads - 1));
     }
 
+    const int64_t block_index_sync{args.GetIntArg("-blockindexsync", kernel::DEFAULT_BLOCK_INDEX_SYNC)};
+    if (block_index_sync < 0 || block_index_sync > 2) {
+        return util::Error{strprintf(_("Invalid -blockindexsync value (%d); must be 0, 1, or 2."),
+                                     block_index_sync)};
+    }
+    opts.block_index_sync = static_cast<int>(block_index_sync);
+
     ReadDatabaseArgs(args, opts.block_tree_db_params.options);
 
     return {};

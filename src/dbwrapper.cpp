@@ -18,6 +18,7 @@
 #include <util/fs_helpers.h>
 #include <util/obfuscation.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <util/translation.h>
 
 #include <lmdb.h>
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -32,6 +34,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -61,12 +64,44 @@ std::string LMDBErrorString(int rc)
     return std::string{mdb_strerror(rc)};
 }
 
+constexpr auto READERS_FULL_LOG_INTERVAL{60s};
+constexpr size_t READERS_FULL_LOG_MAX_LOCATIONS{64};
+
+void RateLimitedReadersFullWarning(const std::string& where, int rc)
+{
+    static std::mutex mutex;
+    static std::unordered_map<std::string, SteadyClock::time_point> last_logged;
+    const auto now{SteadyClock::now()};
+    bool should_log{false};
+    {
+        std::lock_guard lock{mutex};
+        auto it{last_logged.find(where)};
+        if (it != last_logged.end() && now - it->second < READERS_FULL_LOG_INTERVAL) return;
+        if (it == last_logged.end() && last_logged.size() >= READERS_FULL_LOG_MAX_LOCATIONS) {
+            const auto oldest{std::min_element(last_logged.begin(), last_logged.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; })};
+            last_logged.erase(oldest);
+        }
+        last_logged[where] = now;
+        should_log = true;
+    }
+    if (!should_log) return;
+    LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Warning,
+                  "LMDB MDB_READERS_FULL in %s: %s (%d); consider raising -dbcache or -coinprefetchpar=1 "
+                  "(use -debug=leveldb or -debug=lmdb for more detail)\n",
+                  where, LMDBErrorString(rc), rc);
+}
+
 void HandleLMDBError(int rc, const std::string& where)
 {
     if (rc == MDB_SUCCESS) return;
     const std::string errmsg = strprintf("Fatal LMDB error in %s: %s (%d)", where, LMDBErrorString(rc), rc);
-    LogError("%s", errmsg);
-    LogInfo("You can use -debug=leveldb or -debug=lmdb to get more complete diagnostic messages");
+    if (rc == MDB_READERS_FULL) {
+        RateLimitedReadersFullWarning(where, rc);
+    } else {
+        LogError("%s", errmsg);
+        LogInfo("You can use -debug=leveldb or -debug=lmdb to get more complete diagnostic messages");
+    }
     throw dbwrapper_error(errmsg);
 }
 
@@ -421,6 +456,11 @@ bool CDBWrapper::WriteBatch(CDBBatch& batch, bool fSync)
     const bool log_memory = LogDBWrapperDebug();
     const double mem_before = log_memory ? DynamicMemoryUsage() / 1024.0 / 1024 : 0;
     const int max_key_size = mdb_env_get_maxkeysize(ctx.env);
+    const auto write_start{SteadyClock::now()};
+    size_t batch_bytes{0};
+    for (const auto& entry : batch.m_impl_batch->entries) {
+        batch_bytes += entry.key.size() + (entry.erase ? 0 : entry.value.size());
+    }
 
     for (int attempt = 0; attempt < 32; ++attempt) {
         std::lock_guard lock{ctx.write_mutex};
@@ -480,8 +520,10 @@ bool CDBWrapper::WriteBatch(CDBBatch& batch, bool fSync)
 
         if (log_memory) {
             const double mem_after = DynamicMemoryUsage() / 1024.0 / 1024;
-            LogDebug(BCLog::LEVELDB, "WriteBatch LMDB usage: db=%s, before=%.1fMiB, after=%.1fMiB (map %zu MiB)\n",
-                     m_name, mem_before, mem_after, ctx.map_size / (1 << 20));
+            const auto write_us{Ticks<std::chrono::microseconds>(SteadyClock::now() - write_start)};
+            LogDebug(BCLog::LEVELDB, "WriteBatch LMDB: db=%s entries=%zu bytes=%zu sync=%d us=%llu mem %.1f->%.1f MiB (map %zu MiB)\n",
+                     m_name, batch.m_impl_batch->entries.size(), batch_bytes, fSync, write_us,
+                     mem_before, mem_after, ctx.map_size / (1 << 20));
         }
         return true;
     }
@@ -508,6 +550,24 @@ unsigned int CDBWrapper::GetMaxReaders() const
     unsigned int readers{0};
     HandleLMDBError(mdb_env_get_maxreaders(ctx.env, &readers), "get maxreaders");
     return readers;
+}
+
+int CDBWrapper::ReclaimStaleReaders() const
+{
+    const auto& ctx = DBContext();
+    int dead{0};
+    const int rc{mdb_reader_check(ctx.env, &dead)};
+    if (rc != MDB_SUCCESS) {
+        LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Warning,
+                      "LMDB reader check failed: %s (%d)\n", LMDBErrorString(rc), rc);
+        return -1;
+    }
+    return dead;
+}
+
+void CDBWrapper::ReleaseThreadLocalReadTxn() const
+{
+    ReleaseTLSReadTxn(DBContext().env);
 }
 
 const std::string CDBWrapper::OBFUSCATE_KEY_KEY("\000obfuscate_key", 14);

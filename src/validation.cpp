@@ -84,6 +84,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -2272,6 +2273,7 @@ void Chainstate::InitCoinsDB(
     bool should_wipe,
     fs::path leveldb_name)
 {
+    AssertLockHeld(::cs_main);
     if (m_from_snapshot_blockhash) {
         leveldb_name += node::SNAPSHOT_CHAINSTATE_SUFFIX;
     }
@@ -2947,12 +2949,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             util::g_benchstats.coin_prefetch_prevouts.fetch_add(uncached_prevouts.size(), std::memory_order_relaxed);
         }
         const CoinsViewOptions& coin_opts{m_chainman.m_options.coins_view};
+        if (uncached_prevouts.size() < COIN_PREFETCH_PARALLEL_THRESHOLD) {
+            util::BenchStatsInc(util::g_benchstats.coin_prefetch_skip_threshold);
+        } else if (coin_opts.coin_prefetch_workers < 2) {
+            util::BenchStatsInc(util::g_benchstats.coin_prefetch_skip_workers);
+        }
         if (uncached_prevouts.size() >= COIN_PREFETCH_PARALLEL_THRESHOLD
             && coin_opts.coin_prefetch_workers >= 2) {
-            int workers{coin_opts.coin_prefetch_workers};
             CCoinsViewDB& coins_db{CoinsDB()};
             const unsigned int max_readers{coins_db.GetMaxReaders()};
-            workers = std::min(workers, static_cast<int>(std::max(1u, max_readers / 4)));
+            const int workers{ComputeCoinPrefetchWorkers(coin_opts.coin_prefetch_workers, max_readers)};
             if (workers >= 2) {
                 std::vector<PrefetchedCoin> prefetched;
                 bool prefetch_ok{false};
@@ -3200,9 +3206,16 @@ bool Chainstate::FlushStateToDiskOnInterrupt(BlockValidationState& state)
 bool Chainstate::FlushStateToDiskLocked(
     BlockValidationState &state,
     FlushStateMode mode,
-    int nManualPruneHeight)
+    int nManualPruneHeight,
+    util::BenchStatsCsMainHold* outer_cs_main_hold)
 {
     AssertLockHeld(cs_main);
+    std::optional<util::BenchStatsCsMainHold> local_cs_main_hold;
+    if (outer_cs_main_hold == nullptr) {
+        local_cs_main_hold.emplace();
+    }
+    util::BenchStatsCsMainHold* const cs_main_hold{
+        outer_cs_main_hold != nullptr ? outer_cs_main_hold : &*local_cs_main_hold};
     std::set<int> setFilesToPrune;
     bool full_flush_completed = false;
     bool should_write = false;
@@ -3319,16 +3332,58 @@ bool Chainstate::FlushStateToDiskLocked(
                 }
             }
 
-            // Release cs_main during block-index LMDB I/O. Snapshot already taken above; never
-            // acquire cs_main while holding m_cs_block_index_write (lock-order inversion).
+            const bool flush_always{mode == FlushStateMode::ALWAYS};
+            const bool parallel_coins_flush{
+                flush_coins && m_chainman.m_options.coins_view.flush_snapshot};
+            std::optional<CoinsFlushSnapshot> parallel_coins_snapshot;
+            CCoinsViewDB* coins_db{nullptr};
+            const bool will_erase{empty_cache};
+            if (parallel_coins_flush) {
+                parallel_coins_snapshot = CoinsTip().CaptureFlushSnapshot(will_erase);
+                coins_db = &CoinsDB();
+            }
+
+            // Release cs_main during LMDB I/O. Snapshots taken above; never acquire cs_main
+            // while holding m_cs_block_index_write (lock-order inversion).
+            cs_main_hold->Pause();
             LEAVE_CRITICAL_SECTION(cs_main);
             cs_main_leave_guard.m_left = true;
 
             bool block_index_written{false};
-            {
+            bool coins_written{true};
+            const auto block_index_start{SteadyClock::now()};
+            std::thread block_index_thread{[&]() {
+                const auto blkidx_wait_start{SteadyClock::now()};
                 LOCK(m_blockman.m_cs_block_index_write);
+                util::BenchStatsAdd(util::g_benchstats.blkidx_mutex_wait_us,
+                                    static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - blkidx_wait_start)));
                 LOG_TIME_MILLIS_WITH_CATEGORY("write block index to disk", BCLog::BENCH);
-                block_index_written = m_blockman.WriteBlockIndexBatch(block_index_batch);
+                block_index_written = m_blockman.WriteBlockIndexBatch(block_index_batch, flush_always);
+            }};
+
+            std::thread coins_thread;
+            const auto coins_flush_start{SteadyClock::now()};
+            if (parallel_coins_flush) {
+                util::BenchStatsInc(util::g_benchstats.parallel_lmdb_flushes);
+                LogPrintLevel(BCLog::COINDB, BCLog::Level::Debug,
+                              "LMDB parallel flush: block_index + chainstate (flush_always=%d)\n", flush_always);
+                coins_thread = std::thread{[&]() {
+                    const auto flush_wait_start{SteadyClock::now()};
+                    LOCK(m_coins_flush_mutex);
+                    util::BenchStatsAdd(util::g_benchstats.flush_mutex_wait_us,
+                                        static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - flush_wait_start)));
+                    if (flush_always) coins_db->SetSyncFinalBatch(true);
+                    coins_written = coins_db->BatchWriteFromSnapshot(*parallel_coins_snapshot);
+                }};
+            }
+
+            block_index_thread.join();
+            util::BenchStatsAdd(util::g_benchstats.block_index_flush_us,
+                                static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - block_index_start)));
+            if (coins_thread.joinable()) {
+                coins_thread.join();
+                util::BenchStatsAdd(util::g_benchstats.chainstate_flush_us,
+                                    static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - coins_flush_start)));
             }
 
             if (block_index_written) {
@@ -3342,6 +3397,7 @@ bool Chainstate::FlushStateToDiskLocked(
 
             ENTER_CRITICAL_SECTION(cs_main);
             cs_main_leave_guard.m_left = false;
+            cs_main_hold->Resume();
 
             if (fFlushForPrune) {
                 LOG_TIME_MILLIS_WITH_CATEGORY("unlink pruned files", BCLog::BENCH);
@@ -3354,7 +3410,7 @@ bool Chainstate::FlushStateToDiskLocked(
                 LOG_TIME_MILLIS_WITH_CATEGORY(strprintf("write coins cache to disk (%d coins, %.2fKiB)",
                     coins_count, coins_mem_usage >> 10), BCLog::BENCH);
 
-                CCoinsViewDB& coins_db{CoinsDB()};
+                CCoinsViewDB& coins_db_local{CoinsDB()};
                 struct SyncFinalBatchGuard {
                     CCoinsViewDB& m_db;
                     explicit SyncFinalBatchGuard(CCoinsViewDB& db, bool enable) : m_db(db)
@@ -3362,38 +3418,53 @@ bool Chainstate::FlushStateToDiskLocked(
                         if (enable) m_db.SetSyncFinalBatch(true);
                     }
                     ~SyncFinalBatchGuard() { m_db.SetSyncFinalBatch(false); }
-                } sync_guard{coins_db, mode == FlushStateMode::ALWAYS};
+                } sync_guard{coins_db_local, flush_always};
 
-                const bool will_erase{empty_cache};
                 if (m_chainman.m_options.coins_view.flush_snapshot) {
-                    const bool sync_always{mode == FlushStateMode::ALWAYS};
-                    int stale_attempts{0};
-                    while (true) {
-                        const CoinsFlushSnapshot snapshot{CoinsTip().CaptureFlushSnapshot(will_erase)};
-
-                        LEAVE_CRITICAL_SECTION(cs_main);
-                        cs_main_leave_guard.m_left = true;
-                        bool written{false};
-                        {
-                            // Serialize coins LMDB writes so overlapping flushes cannot regress DB_BEST_BLOCK.
-                            LOCK(m_coins_flush_mutex);
-                            if (sync_always) coins_db.SetSyncFinalBatch(true);
-                            written = coins_db.BatchWriteFromSnapshot(snapshot);
-                        }
-                        ENTER_CRITICAL_SECTION(cs_main);
-                        cs_main_leave_guard.m_left = false;
-
-                        if (!written) {
+                    if (parallel_coins_snapshot) {
+                        if (!coins_written) {
                             return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
                         }
-                        if (CoinsTip().ValidateFlushSnapshot(snapshot)) {
-                            CoinsTip().CommitFlushSnapshot(snapshot);
-                            break;
-                        }
-                        ++stale_attempts;
-                        if (stale_attempts == 1 || stale_attempts % 16 == 0) {
-                            LogDebug(BCLog::COINDB, "UTXO flush snapshot stale after out-of-lock write, retrying (attempt %d)\n",
-                                     stale_attempts);
+                        if (CoinsTip().ValidateFlushSnapshot(*parallel_coins_snapshot)) {
+                            CoinsTip().CommitFlushSnapshot(*parallel_coins_snapshot);
+                        } else {
+                            int stale_attempts{0};
+                            while (true) {
+                                util::BenchStatsInc(util::g_benchstats.flush_stale_retries);
+                                const CoinsFlushSnapshot snapshot{CoinsTip().CaptureFlushSnapshot(will_erase)};
+
+                                cs_main_hold->Pause();
+                                LEAVE_CRITICAL_SECTION(cs_main);
+                                cs_main_leave_guard.m_left = true;
+                                bool written{false};
+                                const auto retry_start{SteadyClock::now()};
+                                {
+                                    const auto flush_wait_start{SteadyClock::now()};
+                                    LOCK(m_coins_flush_mutex);
+                                    util::BenchStatsAdd(util::g_benchstats.flush_mutex_wait_us,
+                                                        static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - flush_wait_start)));
+                                    if (flush_always) coins_db_local.SetSyncFinalBatch(true);
+                                    written = coins_db_local.BatchWriteFromSnapshot(snapshot);
+                                }
+                                util::BenchStatsAdd(util::g_benchstats.chainstate_flush_us,
+                                                    static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - retry_start)));
+                                ENTER_CRITICAL_SECTION(cs_main);
+                                cs_main_leave_guard.m_left = false;
+                                cs_main_hold->Resume();
+
+                                if (!written) {
+                                    return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
+                                }
+                                if (CoinsTip().ValidateFlushSnapshot(snapshot)) {
+                                    CoinsTip().CommitFlushSnapshot(snapshot);
+                                    break;
+                                }
+                                ++stale_attempts;
+                                if (stale_attempts == 1 || stale_attempts % 16 == 0) {
+                                    LogDebug(BCLog::COINDB, "UTXO flush snapshot stale after out-of-lock write, retrying (attempt %d)\n",
+                                             stale_attempts);
+                                }
+                            }
                         }
                     }
                 } else if (will_erase ? !CoinsTip().Flush() : !CoinsTip().Sync()) {
@@ -3717,6 +3788,8 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     AssertLockHeld(cs_main);
     if (m_mempool) AssertLockHeld(m_mempool->cs);
 
+    util::BenchStatsCsMainHold cs_main_hold;
+
     assert(pindexNew->pprev == m_chain.Tip());
     // Read block from disk.
     const auto time_1{SteadyClock::now()};
@@ -3729,7 +3802,12 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
         bool read_ok{false};
         {
+            cs_main_hold.Pause();
             ReleaseLocksForBlockIo unlock_for_io{m_mempool};
+            struct ResumeCsMainHold {
+                util::BenchStatsCsMainHold& hold;
+                ~ResumeCsMainHold() { hold.Resume(); }
+            } resume_cs_main_hold{cs_main_hold};
             if (pindexNew->pprev == m_chain.Tip()) {
                 const auto prefetch_start{SteadyClock::now()};
                 if (auto prefetched{m_blockman.PrefetchQueue().TakeIfReady(block_loc)}) {
@@ -3807,11 +3885,13 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
              Ticks<SecondsDouble>(m_chainman.time_flush),
              Ticks<MillisecondsDouble>(m_chainman.time_flush) / m_chainman.num_blocks_total);
     // Write the chain state to disk, if necessary.
-    if (!FlushStateToDiskLocked(state, FlushStateMode::IF_NEEDED)) {
+    if (!FlushStateToDiskLocked(state, FlushStateMode::IF_NEEDED, 0, &cs_main_hold)) {
         return false;
     }
     const auto time_5{SteadyClock::now()};
     m_chainman.time_chainstate += time_5 - time_4;
+    util::BenchStatsAdd(util::g_benchstats.connect_chainstate_us,
+                        static_cast<uint64_t>(Ticks<std::chrono::microseconds>(time_5 - time_4)));
     LogDebug(BCLog::BENCH, "  - Writing chainstate: %.2fms [%.2fs (%.2fms/blk)]\n",
              Ticks<MillisecondsDouble>(time_5 - time_4),
              Ticks<SecondsDouble>(m_chainman.time_chainstate),
@@ -3858,6 +3938,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     }
 
     connectTrace.BlockConnected(pindexNew, std::move(pthisBlock));
+    util::BenchStatsRecordConnectTipEnd();
     return true;
 }
 
@@ -4185,7 +4266,10 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                     break;
                 }
             } while (!m_chain.Tip() || (starting_tip && CBlockIndexWorkComparator()(m_chain.Tip(), starting_tip)));
-            if (!blocks_connected) return true;
+            if (!blocks_connected) {
+                util::BenchStatsRecordAbcIdle();
+                return true;
+            }
 
             const CBlockIndex* pindexFork = m_chain.FindFork(starting_tip);
             bool still_in_ibd = m_chainman.IsInitialBlockDownload();
