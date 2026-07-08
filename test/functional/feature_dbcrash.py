@@ -50,11 +50,14 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
         self.rpc_timeout = 480
         self.supports_cli = False
 
-        # Set -maxmempool=0 to turn off mempool memory sharing with dbcache
+        # Set -maxmempool=0 to turn off mempool memory sharing with dbcache.
+        # Serial chainstate flush avoids parallel LMDB writers during simulated crashes.
         self.base_args = [
             "-limitdescendantsize=0",
             "-maxmempool=0",
             "-dbbatchsize=200000",
+            "-flushsnapshot=0",
+            "-blockindexsync=0",
         ]
 
         # Set different crash ratios and cache sizes.  Note that not all of
@@ -79,8 +82,11 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
         Exceptions on startup should indicate node crash (due to -dbcrashratio), in which case we try again. Give up
         after 60 seconds. Returns the utxo hash of the given node."""
 
+        # Recovery after -dbcrashratio can require many initload restarts; allow longer
+        # than the default 120s when rpc_timeout is raised for Swords LMDB flush.
+        restart_timeout = max(120, self.rpc_timeout // 2) * self.options.timeout_factor
         time_start = time.time()
-        while time.time() - time_start < 120 * self.options.timeout_factor:
+        while time.time() - time_start < restart_timeout:
             try:
                 # Any of these RPC calls could throw due to node crash
                 self.start_node(node_index)
