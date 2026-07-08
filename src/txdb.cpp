@@ -219,8 +219,9 @@ std::vector<uint8_t> EncodeCoinValue(const Coin& coin, const CoinsViewOptions& o
 
     const size_t stored_size{2 + compressed.size()};
     if (stored_size >= serialized.size()) {
-        LogDebug(BCLog::COINDB, "Skipping UTXO zstd compression: stored size %u >= legacy size %u\n",
-                 stored_size, serialized.size());
+        LogPrintLevel(BCLog::COINDB, BCLog::Level::Trace,
+                      "Skipping UTXO zstd compression: stored size %u >= legacy size %u\n",
+                      stored_size, serialized.size());
         return serialized;
     }
 

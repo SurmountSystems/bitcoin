@@ -141,19 +141,54 @@ bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
 
 bool BlockTreeDB::WriteBatchSync(const node::BlockIndexWriteBatch& index_batch, const bool f_sync)
 {
-    CDBBatch batch(*this);
-    for (const auto& [file, info] : index_batch.file_info) {
-        batch.Write(std::make_pair(DB_BLOCK_FILES, file), info);
+    // Metadata first (flags, file info, prune locks). Block indices are chunked so a long
+    // IBD/RPC session does not commit hundreds of indices in one LMDB txn (manual prune).
+    constexpr size_t BLOCK_INDEX_CHUNK{16};
+
+    auto write_batch = [&](CDBBatch& batch, const bool sync) {
+        return WriteBatch(batch, sync);
+    };
+
+    const bool has_meta{
+        index_batch.write_pruned_blockfiles_flag.has_value()
+        || !index_batch.file_info.empty()
+        || !index_batch.prune_locks.empty()
+        || index_batch.last_file != 0};
+    if (has_meta) {
+        CDBBatch batch(*this);
+        if (index_batch.write_pruned_blockfiles_flag.has_value()) {
+            const uint8_t ch{*index_batch.write_pruned_blockfiles_flag ? uint8_t{'1'} : uint8_t{'0'}};
+            batch.Write(std::make_pair(DB_FLAG, "prunedblockfiles"), ch);
+        }
+        for (const auto& [file, info] : index_batch.file_info) {
+            batch.Write(std::make_pair(DB_BLOCK_FILES, file), info);
+        }
+        batch.Write(DB_LAST_BLOCK, index_batch.last_file);
+        for (const auto& prune_lock : index_batch.prune_locks) {
+            if (prune_lock.second.temporary) continue;
+            batch.Write(std::make_pair(DB_PRUNE_LOCK, prune_lock.first), prune_lock.second);
+        }
+        // Always sync when recording first prune so m_have_pruned survives restart.
+        const bool sync_meta{(index_batch.block_indices.empty() && f_sync)
+            || index_batch.write_pruned_blockfiles_flag.has_value()};
+        if (!write_batch(batch, sync_meta)) return false;
     }
-    batch.Write(DB_LAST_BLOCK, index_batch.last_file);
-    for (const auto& [hash, disk_index] : index_batch.block_indices) {
-        batch.Write(std::make_pair(DB_BLOCK_INDEX, hash), disk_index);
+
+    const size_t n_blocks{index_batch.block_indices.size()};
+    for (size_t offset = 0; offset < n_blocks; offset += BLOCK_INDEX_CHUNK) {
+        CDBBatch batch(*this);
+        const size_t end{std::min(offset + BLOCK_INDEX_CHUNK, n_blocks)};
+        for (size_t i = offset; i < end; ++i) {
+            const auto& [hash, disk_index] = index_batch.block_indices[i];
+            batch.Write(std::make_pair(DB_BLOCK_INDEX, hash), disk_index);
+        }
+        const bool sync_chunk{f_sync && end == n_blocks};
+        LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Debug,
+                      "BlockTreeDB::WriteBatchSync chunk [%zu,%zu) of %zu (sync=%d)\n",
+                      offset, end, n_blocks, sync_chunk);
+        if (!write_batch(batch, sync_chunk)) return false;
     }
-    for (const auto& prune_lock : index_batch.prune_locks) {
-        if (prune_lock.second.temporary) continue;
-        batch.Write(std::make_pair(DB_PRUNE_LOCK, prune_lock.first), prune_lock.second);
-    }
-    return WriteBatch(batch, f_sync);
+    return true;
 }
 
 bool BlockTreeDB::WritePruneLock(const std::string& name, const node::PruneLockInfo& lock_info) {
@@ -397,7 +432,8 @@ void BlockManager::FindFilesToPruneManual(
 {
     assert(IsPruneMode() && nManualPruneHeight > 0);
 
-    LOCK2(cs_main, cs_LastBlockFile);
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_LastBlockFile);
     if (chain.m_chain.Height() < 0) {
         return;
     }
@@ -447,7 +483,8 @@ void BlockManager::FindFilesToPrune(
     const Chainstate& chain,
     ChainstateManager& chainman)
 {
-    LOCK2(cs_main, cs_LastBlockFile);
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_LastBlockFile);
     const auto target{GetPruneTargetForChainstate(chain, chainman)};
     const uint64_t target_sync_height = chainman.m_best_header->nHeight;
 
@@ -536,6 +573,11 @@ bool BlockManager::UpdatePruneLock(const std::string& name, const PruneLockInfo&
         }
     }
     stored_lock_info = lock_info;
+    if (!lock_info.temporary) {
+        m_dirty_prune_locks.insert(name);
+    } else {
+        m_dirty_prune_locks.erase(name);
+    }
     return true;
 }
 
@@ -661,8 +703,13 @@ BlockIndexWriteBatch BlockManager::PrepareBlockIndexWriteBatch()
     for (const CBlockIndex* pindex : m_dirty_blockindex) {
         batch.block_indices.emplace_back(pindex->GetBlockHash(), CDiskBlockIndex{pindex});
     }
-    batch.last_file = WITH_LOCK(cs_LastBlockFile, return this->MaxBlockfileNum());
-    batch.prune_locks = m_prune_locks;
+    // last_file is set by the caller immediately before LMDB write (requires cs_LastBlockFile).
+    batch.prune_locks.reserve(m_dirty_prune_locks.size());
+    for (const std::string& name : m_dirty_prune_locks) {
+        if (const auto it{m_prune_locks.find(name)}; it != m_prune_locks.end()) {
+            batch.prune_locks.emplace(it->first, it->second);
+        }
+    }
     return batch;
 }
 
@@ -704,6 +751,9 @@ void BlockManager::CommitBlockIndexWriteBatch(const BlockIndexWriteBatch& batch)
                 m_dirty_blockindex.erase(pindex);
             }
         }
+    }
+    for (const auto& [name, _lock_info] : batch.prune_locks) {
+        m_dirty_prune_locks.erase(name);
     }
 }
 

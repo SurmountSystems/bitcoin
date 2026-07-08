@@ -1262,10 +1262,6 @@ static RPCHelpMan pruneblockchain()
         throw JSONRPCError(RPC_MISC_ERROR, "Cannot prune blocks because node is not in prune mode.");
     }
 
-    LOCK(cs_main);
-    Chainstate& active_chainstate = chainman.ActiveChainstate();
-    CChain& active_chain = active_chainstate.m_chain;
-
     int heightParam = request.params[0].getInt<int>();
     if (heightParam < 0) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Negative block height.");
@@ -1275,30 +1271,41 @@ static RPCHelpMan pruneblockchain()
         return uint64_t(0);
     }
 
-    // Height value more than a billion is too high to be a block height, and
-    // too low to be a block time (corresponds to timestamp from Sep 2001).
-    if (heightParam > 1000000000) {
-        // Add a 2 hour buffer to include blocks which might have had old timestamps
-        const CBlockIndex* pindex = active_chain.FindEarliestAtLeast(heightParam - TIMESTAMP_WINDOW, 0);
-        if (!pindex) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Could not find block with at least the specified timestamp.");
+    Chainstate& active_chainstate = chainman.ActiveChainstate();
+    unsigned int height{0};
+    {
+        LOCK(cs_main);
+        CChain& active_chain = active_chainstate.m_chain;
+
+        // Height value more than a billion is too high to be a block height, and
+        // too low to be a block time (corresponds to timestamp from Sep 2001).
+        if (heightParam > 1000000000) {
+            // Add a 2 hour buffer to include blocks which might have had old timestamps
+            const CBlockIndex* pindex = active_chain.FindEarliestAtLeast(heightParam - TIMESTAMP_WINDOW, 0);
+            if (!pindex) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Could not find block with at least the specified timestamp.");
+            }
+            heightParam = pindex->nHeight;
         }
-        heightParam = pindex->nHeight;
+
+        height = static_cast<unsigned int>(heightParam);
+        const unsigned int chainHeight = static_cast<unsigned int>(active_chain.Height());
+        if (chainHeight < chainman.GetParams().PruneAfterHeight()) {
+            throw JSONRPCError(RPC_MISC_ERROR, "Blockchain is too short for pruning.");
+        } else if (height > chainHeight) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Blockchain is shorter than the attempted prune height.");
+        } else if (height > chainHeight - MIN_BLOCKS_TO_KEEP) {
+            LogDebug(BCLog::RPC, "Attempt to prune blocks close to the tip.  Retaining the minimum number of blocks.\n");
+            height = chainHeight - MIN_BLOCKS_TO_KEEP;
+        }
     }
 
-    unsigned int height = (unsigned int) heightParam;
-    unsigned int chainHeight = (unsigned int) active_chain.Height();
-    if (chainHeight < chainman.GetParams().PruneAfterHeight()) {
-        throw JSONRPCError(RPC_MISC_ERROR, "Blockchain is too short for pruning.");
-    } else if (height > chainHeight) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Blockchain is shorter than the attempted prune height.");
-    } else if (height > chainHeight - MIN_BLOCKS_TO_KEEP) {
-        LogDebug(BCLog::RPC, "Attempt to prune blocks close to the tip.  Retaining the minimum number of blocks.\n");
-        height = chainHeight - MIN_BLOCKS_TO_KEEP;
-    }
-
+    // FlushStateToDisk releases cs_main during LMDB I/O; do not hold cs_main across it or
+    // RPC worker threads can deadlock block-index writers (manual prune with indices).
     PruneBlockFilesManual(active_chainstate, height);
-    return GetPruneHeight(chainman.m_blockman, active_chain).value_or(-1);
+
+    LOCK(cs_main);
+    return GetPruneHeight(chainman.m_blockman, active_chainstate.m_chain).value_or(-1);
 },
     };
 }

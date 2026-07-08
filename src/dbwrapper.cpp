@@ -462,6 +462,10 @@ bool CDBWrapper::WriteBatch(CDBBatch& batch, bool fSync)
         batch_bytes += entry.key.size() + (entry.erase ? 0 : entry.value.size());
     }
 
+    // Drop this thread's cached reader before waiting on write_mutex so a prior
+    // ReadImpl on the same thread cannot block our own commit.
+    InvalidateReadTxns(ctx);
+
     for (int attempt = 0; attempt < 32; ++attempt) {
         std::lock_guard lock{ctx.write_mutex};
         MDB_txn* txn{nullptr};
@@ -505,7 +509,16 @@ bool CDBWrapper::WriteBatch(CDBBatch& batch, bool fSync)
             HandleLMDBError(rc, "write batch");
         }
 
+        if (LogDBWrapperDebug()) {
+            LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Debug,
+                          "WriteBatch LMDB: committing db=%s entries=%zu\n",
+                          m_name, batch.m_impl_batch->entries.size());
+        }
         rc = mdb_txn_commit(txn);
+        if (LogDBWrapperDebug()) {
+            LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Debug,
+                          "WriteBatch LMDB: commit done db=%s rc=%d\n", m_name, rc);
+        }
         if (rc == MDB_MAP_FULL) {
             GrowMapSizeUnlocked();
             continue;
@@ -580,9 +593,16 @@ std::vector<unsigned char> CDBWrapper::CreateObfuscateKey() const
 std::optional<std::string> CDBWrapper::ReadImpl(Span<const std::byte> key) const
 {
     const auto& ctx = DBContext();
-    MDB_txn* txn = BeginReadTxn(ctx);
+    // Ephemeral read txn (no TLS cache): long-lived RPC worker threads must not hold
+    // LMDB readers across requests and starve block-index / chainstate writers.
+    ReleaseTLSReadTxn(ctx.env);
+    HandleLMDBError(mdb_reader_check(ctx.env, nullptr), "read reader check");
+    MDB_txn* txn{nullptr};
+    HandleLMDBError(mdb_txn_begin(ctx.env, nullptr, MDB_RDONLY, &txn), "read transaction begin");
     std::string strValue;
-    if (!GetRaw(txn, ctx.dbi, key, strValue)) {
+    const bool found = GetRaw(txn, ctx.dbi, key, strValue);
+    mdb_txn_abort(txn);
+    if (!found) {
         return std::nullopt;
     }
     return strValue;
@@ -591,9 +611,14 @@ std::optional<std::string> CDBWrapper::ReadImpl(Span<const std::byte> key) const
 bool CDBWrapper::ExistsImpl(Span<const std::byte> key) const
 {
     const auto& ctx = DBContext();
-    MDB_txn* txn = BeginReadTxn(ctx);
+    ReleaseTLSReadTxn(ctx.env);
+    HandleLMDBError(mdb_reader_check(ctx.env, nullptr), "read reader check");
+    MDB_txn* txn{nullptr};
+    HandleLMDBError(mdb_txn_begin(ctx.env, nullptr, MDB_RDONLY, &txn), "read transaction begin");
     std::string strValue;
-    return GetRaw(txn, ctx.dbi, key, strValue);
+    const bool found = GetRaw(txn, ctx.dbi, key, strValue);
+    mdb_txn_abort(txn);
+    return found;
 }
 
 size_t CDBWrapper::EstimateSizeImpl(Span<const std::byte> key1, Span<const std::byte> key2) const

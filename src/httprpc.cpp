@@ -5,6 +5,8 @@
 #include <httprpc.h>
 
 #include <common/args.h>
+#include <rpc/server_util.h>
+#include <validation.h>
 #include <crypto/hmac_sha256.h>
 #include <httpserver.h>
 #include <logging.h>
@@ -149,6 +151,15 @@ static bool RPCAuthorized(const std::string& strAuth, std::string& strAuthUserna
     return multiUserAuthorized(strUserPass, out_wallet_restriction);
 }
 
+static void ReleaseRPCReadTxns(const std::any& context)
+{
+    try {
+        EnsureAnyChainman(context).ReleaseThreadLocalReadTxns();
+    } catch (...) {
+        // Context may be unavailable during early shutdown; ignore.
+    }
+}
+
 static bool HTTPReq_JSONRPC(const std::any& context, HTTPRequest* req)
 {
     // JSONRPC handles only POST
@@ -277,11 +288,14 @@ static bool HTTPReq_JSONRPC(const std::any& context, HTTPRequest* req)
         req->WriteReply(HTTP_OK, reply.write() + "\n");
     } catch (UniValue& e) {
         JSONErrorReply(req, std::move(e), jreq);
+        ReleaseRPCReadTxns(context);
         return false;
     } catch (const std::exception& e) {
         JSONErrorReply(req, JSONRPCError(RPC_PARSE_ERROR, e.what()), jreq);
+        ReleaseRPCReadTxns(context);
         return false;
     }
+    ReleaseRPCReadTxns(context);
     return true;
 }
 

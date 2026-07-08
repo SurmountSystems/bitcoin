@@ -135,6 +135,11 @@ BOOST_AUTO_TEST_CASE(block_read_loc_snapshot)
 BOOST_AUTO_TEST_CASE(block_index_prepare_write_commit)
 {
     BlockManager& blockman{m_node.chainman->m_blockman};
+
+    // Regtest block-index auto-flush during TestChain100Setup may commit all dirty
+    // indices; mine one block so PrepareBlockIndexWriteBatch has work to do.
+    mineBlocks(1);
+
     node::BlockIndexWriteBatch batch;
     size_t num_indices{0};
     {

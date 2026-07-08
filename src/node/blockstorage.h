@@ -39,6 +39,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -214,8 +215,12 @@ struct BlockIndexWriteBatch {
     int last_file{0};
     std::vector<std::pair<uint256, CDiskBlockIndex>> block_indices;
     std::unordered_map<std::string, PruneLockInfo> prune_locks;
+    std::optional<bool> write_pruned_blockfiles_flag;
 
-    bool empty() const { return file_info.empty() && block_indices.empty(); }
+    bool empty() const
+    {
+        return file_info.empty() && block_indices.empty() && !write_pruned_blockfiles_flag.has_value();
+    }
 };
 
 enum BlockfileType {
@@ -298,7 +303,7 @@ private:
         std::set<int>& setFilesToPrune,
         int nManualPruneHeight,
         const Chainstate& chain,
-        ChainstateManager& chainman);
+        ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_LastBlockFile);
 
     /**
      * Prune block and undo files (blk???.dat and rev???.dat) so that the disk space used is less than a user-defined target.
@@ -320,7 +325,7 @@ private:
         std::set<int>& setFilesToPrune,
         int last_prune,
         const Chainstate& chain,
-        ChainstateManager& chainman);
+        ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_LastBlockFile);
 
     RecursiveMutex cs_LastBlockFile;
     std::vector<CBlockFileInfo> m_blockfile_info;
@@ -379,6 +384,7 @@ public:
      * avoid assuming any particular buffer size.
      */
     std::unordered_map<std::string, PruneLockInfo> m_prune_locks GUARDED_BY(::cs_main);
+    std::unordered_set<std::string> m_dirty_prune_locks GUARDED_BY(::cs_main);
 
 private:
     BlockfileType BlockfileTypeForHeight(int height);

@@ -16,11 +16,19 @@ from test_framework.util import (
 class FeatureIndexPruneTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 4
+        # Swords LMDB flush can exceed default HTTP timeout (rpc_timeout // 2); use 480 -> 240s HTTP.
+        self.rpc_timeout = 480
+        # Trace logging during flush writes one line per UTXO and can stall I/O.
+        # Avoid per-UTXO trace spam; serial chainstate flush avoids parallel LMDB deadlock under index load.
+        # blockstorage debug: assert_debug_log expects UnlinkPrunedFiles (LogDebug).
+        # Default functional-test loglevel is trace; do not override with info or LogDebug
+        # prune messages (UnlinkPrunedFiles) are filtered out and assert_debug_log fails.
+        swords_args = ["-debug=blockstorage", "-flushsnapshot=0", "-blockindexsync=0"]
         self.extra_args = [
-            ["-fastprune", "-prune=1", "-blockfilterindex=1"],
-            ["-fastprune", "-prune=1", "-coinstatsindex=1"],
-            ["-fastprune", "-prune=1", "-blockfilterindex=1", "-coinstatsindex=1"],
-            [],
+            ["-fastprune", "-prune=1", "-blockfilterindex=1", *swords_args],
+            ["-fastprune", "-prune=1", "-coinstatsindex=1", *swords_args],
+            ["-fastprune", "-prune=1", "-blockfilterindex=1", "-coinstatsindex=1", *swords_args],
+            swords_args,
         ]
 
     def setup_network(self):
@@ -55,7 +63,7 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
 
     def restart_without_indices(self):
         for i in range(3):
-            self.restart_node(i, extra_args=["-fastprune", "-prune=1"])
+            self.restart_node(i, extra_args=["-fastprune", "-prune=1", "-debug=blockstorage", "-flushsnapshot=0", "-blockindexsync=0"])
 
     def run_test(self):
         filter_nodes = [self.nodes[0], self.nodes[2]]
@@ -74,7 +82,7 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
 
         self.log.info("prune some blocks")
         for node in self.nodes[:2]:
-            with node.assert_debug_log(['Prune: UnlinkPrunedFiles deleted blk/rev (00000)']):
+            with node.assert_debug_log(['Prune: UnlinkPrunedFiles deleted blk/rev (00000)'], timeout=60):
                 pruneheight_new = node.pruneblockchain(400)
                 # the prune heights used here and below are magic numbers that are determined by the
                 # thresholds at which block files wrap, so they depend on disk serialization and default block file size.
@@ -146,7 +154,7 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
         self.sync_index(height=2500)
 
         for node in self.nodes[:2]:
-            with node.assert_debug_log(['Prune: UnlinkPrunedFiles deleted blk/rev (00006)']):
+            with node.assert_debug_log(['Prune: UnlinkPrunedFiles deleted blk/rev (00006)'], timeout=60):
                 pruneheight_new = node.pruneblockchain(2500)
                 assert 2153 <= pruneheight_new <= 2160, f"unexpected pruneheight {pruneheight_new}"  # Swords: extended+zstd wrap (upstream: 2005)
 

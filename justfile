@@ -10,6 +10,9 @@ jobs := env_var_or_default("SWORDS_JOBS", num_cpus())
 datadir := env_var_or_default("SWORDS_DATADIR", env_var("HOME") + "/.bitcoin-swords")
 # Profile logs live OUTSIDE the datadir so reset-datadir never touches them.
 profile_logs := env_var_or_default("SWORDS_LOG_ARCHIVE", env_var("HOME") + "/.bitcoin-swords-profile-logs")
+# Offline verify/check transcripts + functional test datadirs (stable; not /tmp).
+check_logs_root := profile_logs / "check-runs"
+functional_logs_root := profile_logs / "functional-tests"
 # Keep in sync with benchstats_parse.DEFAULT_MILESTONES via default_milestones_arg().
 default_milestones := `python3 contrib/swords/benchstats_parse.py default-milestones`
 
@@ -176,8 +179,10 @@ list-profile-logs:
         exit 0
     fi
     echo "Profile logs: $archive_root"
-    [[ -f "$archive_root/LATEST.txt" ]] && echo "Latest: $(cat "$archive_root/LATEST.txt")"
-    ls -1dt "$archive_root"/*/ 2>/dev/null | head -20 || echo "(empty)"
+    [[ -f "$archive_root/LATEST.txt" ]] && echo "IBD archive latest: $(cat "$archive_root/LATEST.txt")"
+    ls -1dt "$archive_root"/*/ 2>/dev/null | grep -v '/check-runs$' | grep -v '/functional-tests$' | head -20 || true
+    echo "--- check runs (just check / verify transcripts) ---"
+    just check-logs
 
 [doc("IBD read-path unit tests (equivalence + decompress + locking); recipe name test-phase-d is historical")]
 test-phase-d: build-tests
@@ -418,11 +423,59 @@ check-tsan:
     echo "=== TSan: txdb_prefetch_tests ==="
     {{test_bitcoin_tsan}} --run_test=txdb_prefetch_tests
 
-[doc("Functional 4-pack (assumeutxo, dbcrash, coinstatsindex, index_prune)")]
+[doc("Functional 4-pack (assumeutxo, dbcrash, coinstatsindex, index_prune); logs under profile_logs/functional-tests/ or SWORDS_FUNCTIONAL_TMPDIR")]
 test-functional:
-    {{root}}/test/functional/test_runner.py --combinedlogslen=4000 \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    func_root="${SWORDS_FUNCTIONAL_TMPDIR:-{{functional_logs_root}}}"
+    mkdir -p "$func_root"
+    # Avoid /tmp — full tmpfs causes LMDB sync + debug.log writes to hang mid-flush.
+    export TMPDIR="$func_root"
+    avail_kb="$(df -Pk "$func_root" | awk 'NR==2 {print $4}')"
+    min_kb=$((2 * 1024 * 1024))  # 2 GiB
+    if [[ "$avail_kb" -lt "$min_kb" ]]; then
+        echo "ERROR: need >=2GiB free under $func_root for functional tests (have $((avail_kb / 1024))MiB)" >&2
+        exit 1
+    fi
+    stamp="$(date -u +%Y%m%d_%H%M%S)"
+    results="$func_root/results_$stamp.csv"
+    echo "Functional test logs: $func_root (results -> $results)"
+    echo "TMPDIR=$TMPDIR (sequential -j1 to avoid LMDB contention with dbcrash)"
+    {{root}}/test/functional/test_runner.py --combinedlogslen=4000 --jobs 1 \
+        --tmpdirprefix "$func_root" --resultsfile "$results" \
         feature_assumeutxo.py feature_dbcrash.py \
         feature_coinstatsindex.py feature_index_prune.py
+    runner_dir="$(ls -1dt "$func_root"/test_runner_* 2>/dev/null | head -1 || true)"
+    if [[ -n "$runner_dir" ]]; then
+        ln -sfn "$(basename "$runner_dir")" "$func_root/latest"
+        echo "$runner_dir" > "$func_root/LATEST.txt"
+    fi
+
+[doc("Show latest check/functional log paths (for agents and post-mortems)")]
+check-logs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    archive="{{check_logs_root}}"
+    func="{{functional_logs_root}}"
+    echo "Check runs:    $archive"
+    if [[ -L "$archive/latest" ]]; then
+        echo "  latest -> $(readlink -f "$archive/latest")"
+        echo "  transcript: $(readlink -f "$archive/latest")/check.log"
+    elif [[ -f "$archive/LATEST.txt" ]]; then
+        echo "  latest: $(cat "$archive/LATEST.txt")"
+    else
+        echo "  (no check runs yet)"
+    fi
+    echo "Functional:    $func"
+    if [[ -L "$func/latest" ]]; then
+        echo "  latest -> $(readlink -f "$func/latest")"
+    elif [[ -f "$func/LATEST.txt" ]]; then
+        echo "  latest: $(cat "$func/LATEST.txt")"
+    else
+        echo "  (no functional runs yet)"
+    fi
+    echo "Combine logs:  python3 {{root}}/test/functional/combine_logs.py <test_tmpdir>"
+    echo "Profile logs:  just list-profile-logs"
 
 [doc("Offline Swords gates: build + curated C++ tests + Python tool tests + functional 4-pack (no TSan, no flush pack, no live IBD)")]
 verify: build test-bootstrap test-phase-d test-parse-log test-parse-benchstats test-compare-benchstats test-phase3 test-baseline test-phase0 test-phase5 test-phase6 test-promotion-gates test-functional
@@ -431,8 +484,26 @@ verify: build test-bootstrap test-phase-d test-parse-log test-parse-benchstats t
 check live="":
     #!/usr/bin/env bash
     set -euo pipefail
+    set -o pipefail
     export SWORDS_JOBS="${SWORDS_JOBS:-4}"
+    stamp="$(date -u +%Y%m%d_%H%M%S)"
+    run_dir="{{check_logs_root}}/$stamp"
+    mkdir -p "$run_dir/functional"
+    ln -sfn "$stamp" "{{check_logs_root}}/latest"
+    echo "$run_dir" > "{{check_logs_root}}/LATEST.txt"
+    {
+        echo "check_run_dir=$run_dir"
+        echo "started_at_utc=$stamp"
+        echo "swords_jobs=$SWORDS_JOBS"
+        echo "git_head=$(git -C {{root}} rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        echo "git_branch=$(git -C {{root}} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+        echo "live_tier={{live}}"
+    } > "$run_dir/meta.txt"
+    export SWORDS_FUNCTIONAL_TMPDIR="$run_dir/functional"
+    {
     echo "=== check: SWORDS_JOBS=$SWORDS_JOBS ==="
+    echo "=== check logs: $run_dir/check.log ==="
+    echo "=== functional datadirs: $run_dir/functional/ ==="
     echo "=== Tier 1+2: verify (build, phase-d, Python gates, functional 4-pack) ==="
     just verify
     echo "=== Tier 1: flush / locking pack (not in verify) ==="
@@ -450,6 +521,8 @@ check live="":
         echo "=== Tier 3 skipped (offline). After IBD sweep: just check live ==="
     fi
     echo "=== check: all requested tiers passed ==="
+    echo "finished_at_utc=$(date -u +%Y%m%d_%H%M%S)" >> "$run_dir/meta.txt"
+    } 2>&1 | tee "$run_dir/check.log"
 
 [doc("Wipe chain data; keeps bitcoin.conf (SWORDS_DATADIR, default ~/.bitcoin-swords)")]
 reset-datadir:

@@ -705,6 +705,9 @@ public:
     //! Does this chainstate have a UTXO set attached?
     bool HasCoinsViews() const { return (bool)m_coins_views; }
 
+    //! Release this thread's cached chainstate LMDB read txn (no cs_main required).
+    void ReleaseThreadLocalReadTxn() const;
+
     //! The cache size of the on-disk coins view.
     size_t m_coinsdb_cache_size_bytes{0};
 
@@ -1184,6 +1187,9 @@ public:
 
     //! Get all chainstates currently being used.
     std::vector<Chainstate*> GetAll();
+
+    //! Release cached LMDB read txns on this thread (RPC worker cleanup).
+    void ReleaseThreadLocalReadTxns();
 
     //! Construct and activate a Chainstate on the basis of UTXO snapshot data.
     //!

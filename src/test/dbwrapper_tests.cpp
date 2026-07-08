@@ -464,6 +464,30 @@ BOOST_AUTO_TEST_CASE(dbwrapper_concurrent_reads)
     BOOST_CHECK_EQUAL(failures.load(), 0);
 }
 
+BOOST_AUTO_TEST_CASE(dbwrapper_read_releases_tls_reader)
+{
+    fs::path ph = m_args.GetDataDirBase() / "dbwrapper_read_releases_tls_reader";
+    CDBWrapper dbw{{.path = ph, .cache_bytes = 1 << 20, .wipe_data = true, .obfuscate = false}};
+    BOOST_REQUIRE(dbw.Write(uint8_t{0}, m_rng.rand256()));
+
+    std::atomic<bool> writer_done{false};
+    std::thread writer([&]() {
+        BOOST_CHECK(dbw.Write(uint8_t{1}, m_rng.rand256()));
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    // Read in a tight loop without explicit ReleaseThreadLocalReadTxn; each ReadImpl
+    // must release its cached reader so the writer is not starved.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!writer_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        uint256 value;
+        BOOST_CHECK(dbw.Read(uint8_t{0}, value));
+    }
+    writer.join();
+    BOOST_CHECK(writer_done.load());
+}
+
 BOOST_AUTO_TEST_CASE(dbwrapper_concurrent_read_write)
 {
     fs::path ph = m_args.GetDataDirBase() / "dbwrapper_concurrent_read_write";

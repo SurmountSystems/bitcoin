@@ -3220,6 +3220,7 @@ bool Chainstate::FlushStateToDiskLocked(
     bool full_flush_completed = false;
     bool should_write = false;
     bool fFlushForPrune = false;
+    bool fWritePrunedFlag = false;
     bool fCacheLarge = false;
     bool fCacheCritical = false;
     int tip_height = 0;
@@ -3267,9 +3268,10 @@ bool Chainstate::FlushStateToDiskLocked(
                 }
                 if (!setFilesToPrune.empty()) {
                     fFlushForPrune = true;
+                    // Block-tree LMDB writes must run under m_cs_block_index_write, not cs_main
+                    // (see WriteBlockIndexDB lock order; WriteFlag under cs_main caused prune deadlocks).
                     if (!m_blockman.m_have_pruned) {
-                        m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true);
-                        m_blockman.m_have_pruned = true;
+                        fWritePrunedFlag = true;
                     }
                 }
             }
@@ -3288,8 +3290,15 @@ bool Chainstate::FlushStateToDiskLocked(
         }
         // It's been a while since we wrote the block index and chain state to disk. Do this frequently, so we don't need to redownload or reindex after a crash.
         bool fPeriodicWrite = mode == FlushStateMode::PERIODIC && nNow >= m_next_write;
+        bool fRegtestDirtyBlockIndex{false};
+        if (m_chainman.GetParams().GetChainType() == ChainType::REGTEST) {
+            // RPC linear_sync can connect hundreds of blocks before the periodic timer fires.
+            constexpr size_t REGTEST_BLOCK_INDEX_FLUSH_THRESHOLD{16};
+            fRegtestDirtyBlockIndex = m_blockman.m_dirty_blockindex.size() >= REGTEST_BLOCK_INDEX_FLUSH_THRESHOLD;
+        }
         // Combine all conditions that result in a write to disk.
-        should_write = (mode == FlushStateMode::ALWAYS) || fCacheLarge || fCacheCritical || fPeriodicWrite || fFlushForPrune;
+        should_write = (mode == FlushStateMode::ALWAYS) || fCacheLarge || fCacheCritical || fPeriodicWrite
+            || fFlushForPrune || fRegtestDirtyBlockIndex;
         if (should_write) {
             // Ensure we can write block index
             if (!CheckDiskSpace(m_blockman.m_opts.blocks_dir)) {
@@ -3306,6 +3315,10 @@ bool Chainstate::FlushStateToDiskLocked(
         if (should_write) {
             tip_height = m_chain.Height();
             block_index_batch = m_blockman.PrepareBlockIndexWriteBatch();
+            if (fWritePrunedFlag) {
+                block_index_batch.write_pruned_blockfiles_flag = true;
+            }
+
             coins_count = CoinsTip().GetCacheSize();
             coins_mem_usage = CoinsTip().DynamicMemoryUsage();
             flush_coins = !CoinsTip().GetBestBlock().IsNull();
@@ -3345,6 +3358,7 @@ bool Chainstate::FlushStateToDiskLocked(
 
             // Release cs_main during LMDB I/O. Snapshots taken above; never acquire cs_main
             // while holding m_cs_block_index_write (lock-order inversion).
+            m_chainman.ReleaseThreadLocalReadTxns();
             cs_main_hold->Pause();
             LEAVE_CRITICAL_SECTION(cs_main);
             cs_main_leave_guard.m_left = true;
@@ -3352,14 +3366,31 @@ bool Chainstate::FlushStateToDiskLocked(
             bool block_index_written{false};
             bool coins_written{true};
             const auto block_index_start{SteadyClock::now()};
-            std::thread block_index_thread{[&]() {
+            const auto write_block_index = [&]() {
+                block_index_batch.last_file = WITH_LOCK(m_blockman.cs_LastBlockFile, return m_blockman.MaxBlockfileNum());
                 const auto blkidx_wait_start{SteadyClock::now()};
                 LOCK(m_blockman.m_cs_block_index_write);
                 util::BenchStatsAdd(util::g_benchstats.blkidx_mutex_wait_us,
                                     static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - blkidx_wait_start)));
+                m_blockman.m_block_tree_db->ReleaseThreadLocalReadTxn();
+                if (!fFlushForPrune) {
+                    if (const int reclaimed{m_blockman.m_block_tree_db->ReclaimStaleReaders()}; reclaimed > 0) {
+                        LogPrintLevel(BCLog::LEVELDB, BCLog::Level::Debug,
+                                      "Reclaimed %d stale block-tree LMDB readers before index flush\n", reclaimed);
+                    }
+                }
                 LOG_TIME_MILLIS_WITH_CATEGORY("write block index to disk", BCLog::BENCH);
-                block_index_written = m_blockman.WriteBlockIndexBatch(block_index_batch, flush_always);
-            }};
+                block_index_written = m_blockman.WriteBlockIndexBatch(block_index_batch, flush_always || fFlushForPrune);
+            };
+            // Manual prune runs on an RPC worker; write block index inline after releasing cs_main
+            // (same pattern as WriteBlockIndexDB) so we do not pile up join() deadlocks with
+            // background PERIODIC flushes still finishing their block_index threads.
+            std::thread block_index_thread;
+            if (fFlushForPrune) {
+                write_block_index();
+            } else {
+                block_index_thread = std::thread{write_block_index};
+            }
 
             std::thread coins_thread;
             const auto coins_flush_start{SteadyClock::now()};
@@ -3377,7 +3408,9 @@ bool Chainstate::FlushStateToDiskLocked(
                 }};
             }
 
-            block_index_thread.join();
+            if (block_index_thread.joinable()) {
+                block_index_thread.join();
+            }
             util::BenchStatsAdd(util::g_benchstats.block_index_flush_us,
                                 static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - block_index_start)));
             if (coins_thread.joinable()) {
@@ -3386,10 +3419,7 @@ bool Chainstate::FlushStateToDiskLocked(
                                     static_cast<uint64_t>(Ticks<std::chrono::microseconds>(SteadyClock::now() - coins_flush_start)));
             }
 
-            if (block_index_written) {
-                LOCK(cs_main);
-                m_blockman.CommitBlockIndexWriteBatch(block_index_batch);
-            } else {
+            if (!block_index_written) {
                 ENTER_CRITICAL_SECTION(cs_main);
                 cs_main_leave_guard.m_left = false;
                 return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to block index database."));
@@ -3398,6 +3428,15 @@ bool Chainstate::FlushStateToDiskLocked(
             ENTER_CRITICAL_SECTION(cs_main);
             cs_main_leave_guard.m_left = false;
             cs_main_hold->Resume();
+            if (fWritePrunedFlag) {
+                // Batch write also records the flag; explicit WriteFlag ensures it is
+                // durable before we return (metadata chunk may otherwise omit mdb_env_sync).
+                if (!m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true)) {
+                    return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to block index database."));
+                }
+                m_blockman.m_have_pruned = true;
+            }
+            m_blockman.CommitBlockIndexWriteBatch(block_index_batch);
 
             if (fFlushForPrune) {
                 LOG_TIME_MILLIS_WITH_CATEGORY("unlink pruned files", BCLog::BENCH);
@@ -3406,6 +3445,8 @@ bool Chainstate::FlushStateToDiskLocked(
             }
 
             if (flush_coins) {
+                LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Debug,
+                              "FlushStateToDisk: flushing coins cache (coins=%zu)\n", coins_count);
                 if (coins_mem_usage >= WARN_FLUSH_COINS_SIZE) LogWarning("Flushing large (%d GiB) UTXO set to disk, it may take several minutes", coins_mem_usage >> 30);
                 LOG_TIME_MILLIS_WITH_CATEGORY(strprintf("write coins cache to disk (%d coins, %.2fKiB)",
                     coins_count, coins_mem_usage >> 10), BCLog::BENCH);
@@ -6506,6 +6547,22 @@ std::vector<Chainstate*> ChainstateManager::GetAll()
     }
 
     return out;
+}
+
+void Chainstate::ReleaseThreadLocalReadTxn() const
+{
+    if (m_coins_views) {
+        m_coins_views->m_dbview.ReleaseThreadLocalReadTxn();
+    }
+}
+
+void ChainstateManager::ReleaseThreadLocalReadTxns()
+{
+    m_blockman.m_block_tree_db->ReleaseThreadLocalReadTxn();
+    LOCK(::cs_main);
+    for (Chainstate* cs : GetAll()) {
+        cs->ReleaseThreadLocalReadTxn();
+    }
 }
 
 Chainstate& ChainstateManager::InitializeChainstate(CTxMemPool* mempool)
